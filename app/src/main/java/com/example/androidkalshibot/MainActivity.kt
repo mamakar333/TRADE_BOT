@@ -13,7 +13,6 @@ import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -72,7 +71,11 @@ private fun encryptedPrefs(context: Context) =
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // Removed enableEdgeToEdge() 2026-08-03: debug log evidence showed the
+        // page loading successfully with zero errors, which points at a layout
+        // sizing problem rather than a load/auth failure -- edge-to-edge +
+        // Scaffold inset handling collapsing the content area to zero size is
+        // a known way to get exactly "loaded fine, renders nothing".
         setContent {
             AndroidKalshiBotTheme {
                 AppRoot()
@@ -235,6 +238,8 @@ fun DashboardScreen(url: String, user: String, pass: String, onOpenSettings: () 
                     WebView(context).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.useWideViewPort = true
+                        settings.loadWithOverviewMode = true
                         // Full remote DevTools via chrome://inspect on a USB-connected
                         // computer -- the most reliable way to see exactly what's
                         // happening if the log panel below isn't enough.
@@ -270,7 +275,7 @@ fun DashboardScreen(url: String, user: String, pass: String, onOpenSettings: () 
                             // would show up.
                             override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
                                 if (msg != null) {
-                                    loadLog.add("[console/${msg.messageLevel()}] ${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
+                                    log("[console/${msg.messageLevel()}] ${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
                                 }
                                 return true
                             }
@@ -281,7 +286,7 @@ fun DashboardScreen(url: String, user: String, pass: String, onOpenSettings: () 
                             override fun onReceivedHttpAuthRequest(
                                 view: WebView?, handler: HttpAuthHandler?, host: String?, realm: String?,
                             ) {
-                                loadLog.add("[auth] challenge for host=$host realm=$realm")
+                                log("[auth] challenge for host=$host realm=$realm")
                                 if (handler != null && user.isNotBlank()) {
                                     handler.proceed(user, pass)
                                 } else {
@@ -304,7 +309,7 @@ fun DashboardScreen(url: String, user: String, pass: String, onOpenSettings: () 
                             override fun onReceivedSslError(
                                 view: WebView?, handler: SslErrorHandler?, error: SslError?,
                             ) {
-                                loadLog.add("[ssl error] ${error?.primaryError} for ${error?.url}")
+                                log("[ssl error] ${error?.primaryError} for ${error?.url}")
                                 handler?.cancel()
                             }
 
@@ -316,7 +321,7 @@ fun DashboardScreen(url: String, user: String, pass: String, onOpenSettings: () 
                                 error: android.webkit.WebResourceError?,
                             ) {
                                 if (request?.isForMainFrame == true) {
-                                    loadLog.add("[load error] ${error?.errorCode} ${error?.description} loading ${request.url}")
+                                    log("[load error] ${error?.errorCode} ${error?.description} loading ${request.url}")
                                 }
                             }
 
@@ -325,12 +330,16 @@ fun DashboardScreen(url: String, user: String, pass: String, onOpenSettings: () 
                             // in a loop (suspected from server-side access-log patterns).
                             override fun onPageStarted(view: WebView?, pageUrl: String?, favicon: android.graphics.Bitmap?) {
                                 val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
-                                loadLog.add("[nav] page started @ $t: $pageUrl")
+                                log("[nav] page started @ $t: $pageUrl")
                             }
 
                             override fun onPageFinished(view: WebView?, pageUrl: String?) {
                                 val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
-                                loadLog.add("[nav] page finished @ $t: $pageUrl")
+                                // Direct proof, not another guess: if this ever prints
+                                // 0x0 (or near it), the WebView really is being laid out
+                                // with no visible area -- confirms the sizing theory
+                                // outright instead of inferring it from load timing.
+                                log("[nav] page finished @ $t: $pageUrl (view size ${view?.width}x${view?.height})")
                             }
                         }
                         loadUrl(url)
