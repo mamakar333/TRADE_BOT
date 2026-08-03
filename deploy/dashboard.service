@@ -1,0 +1,32 @@
+[Unit]
+Description=Kalshi trading dashboard (Streamlit) - read/control UI only
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/home/tradebot/TRADE_BOT
+# 127.0.0.1 only -- never bind a public interface. The only way in is
+# through Caddy (Caddyfile), which terminates HTTPS and requires a login
+# before it will even proxy a request here.
+ExecStart=/home/tradebot/TRADE_BOT/.venv/bin/python3 -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/tradebot/TRADE_BOT/logs/streamlit_stdout.log
+StandardError=append:/home/tradebot/TRADE_BOT/logs/streamlit_stdout.log
+
+# Hardening. Note: ProtectHome is deliberately left at its default (off) --
+# the app lives inside /home/tradebot by design (no dedicated /opt setup),
+# and ProtectHome=true blocks exec() from within /home entirely even with
+# ReadWritePaths carving out a path there (confirmed live: 203/EXEC on
+# deploy). ProtectSystem=strict already locks down the rest of the
+# filesystem to read-only outside ReadWritePaths.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/tradebot/TRADE_BOT
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Secrets
+.env
+*.pem
+
+# Paper-trading local state
+paper_trading.db
+paper_trading.db-wal
+paper_trading.db-shm
+logs/
+
+# Live (real-money) trading local state
+live_trading.db
+live_trading.db-wal
+live_trading.db-shm

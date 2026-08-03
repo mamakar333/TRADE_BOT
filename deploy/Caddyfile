@@ -1,0 +1,16 @@
+{{DASHBOARD_HOSTNAME}} {
+	# Everything below this line is unreachable without the password --
+	# Caddy checks basic_auth before reverse_proxy ever runs.
+	# This is a TEMPLATE -- see deploy/README.md step 7. Don't copy this
+	# file to the server as-is; the {{...}} placeholders get filled in
+	# with `sed` first, into a generated file that Caddy actually reads.
+	basic_auth {
+		{{BASIC_AUTH_USER}} {{BASIC_AUTH_HASH}}
+	}
+
+	log {
+		output file /var/log/caddy/access.log
+	}
+
+	reverse_proxy 127.0.0.1:8501
+}
