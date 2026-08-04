@@ -14,6 +14,16 @@ WorkingDirectory=/home/tradebot/TRADE_BOT
 ExecStart=/home/tradebot/TRADE_BOT/.venv/bin/python3 -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501
 Restart=always
 RestartSec=5
+# Found live 2026-08-04: the Start/Stop button spawns run_live_trading.py as
+# a detached subprocess (bot_control.start(), start_new_session=True) so it
+# survives THIS service exiting/restarting -- but systemd's default
+# KillMode=control-group kills every process in the service's cgroup
+# regardless of session, silently killing the live bot (with an open real
+# position) the moment this service was restarted for an unrelated app.py
+# deploy. KillMode=process makes systemd only ever signal the tracked main
+# PID, leaving the detached bot subprocess alone, matching what
+# start_new_session=True already assumed was true.
+KillMode=process
 StandardOutput=append:/home/tradebot/TRADE_BOT/logs/streamlit_stdout.log
 StandardError=append:/home/tradebot/TRADE_BOT/logs/streamlit_stdout.log
 

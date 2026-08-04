@@ -29,6 +29,14 @@ your browser --HTTPS+password--> Caddy (443) --localhost only--> Streamlit dashb
   The dashboard itself *does* auto-restart (systemd, `Restart=always`) --
   it's just a UI, there's no reason it shouldn't always be up so you can
   check status and hit Start yourself.
+- **The watchdog** (`bot-watchdog.timer`, added 2026-08-04 after a real
+  ~75min silent gap overnight with no crash or error logged) runs
+  `run_watchdog.py` every 3 minutes and brings the bot back if it finds it
+  unexpectedly down -- but only when the last thing you did was press
+  Start, never after Stop, and never across a reboot (same "stays off"
+  guarantee as above -- see `bot_control.watchdog_check()`'s docstring).
+  It closes the gap between "crashed mid-session" (now auto-recovered) and
+  "server rebooted" (still stays off, unchanged).
 
 ## 1. Create the server
 
@@ -103,6 +111,43 @@ ssh tradebot@<ip> 'cd /home/tradebot/TRADE_BOT && ~/.local/bin/uv sync'
 scp deploy/dashboard.service root@<ip>:/etc/systemd/system/
 ssh root@<ip> 'systemctl daemon-reload && systemctl enable --now dashboard'
 ```
+
+## 6b. Set up the bot watchdog (optional but recommended)
+
+```
+scp deploy/bot-watchdog.service deploy/bot-watchdog.timer root@<ip>:/etc/systemd/system/
+ssh root@<ip> 'systemctl daemon-reload && systemctl enable --now bot-watchdog.timer'
+```
+
+Brings the bot back automatically if it dies unexpectedly mid-session
+(crash, an accidental kill) while you were away -- never after you press
+Stop, and never across a server reboot. See the Architecture section above.
+
+## 6c. Set up the paper-trading bot (A/B control, no real money)
+
+No systemd unit for this one -- 2026-08-04, switched to the same manual
+start/stop model as the live bot (`trade_bot/paper_bot_control.py`, a PID
+file + SIGTERM, detached subprocess via `subprocess.Popen(...,
+start_new_session=True)`), specifically so the Start/Stop buttons in the
+dashboard and Android app actually control it. A `Restart=always` systemd
+unit would fight a manual Stop the same way it would for the live bot (see
+the Architecture section above) -- this one just doesn't auto-restart on
+crash at all, per explicit request for a manual button rather than another
+watchdog.
+
+Start it once after `dashboard`/`api` are up, either from the dashboard's
+Bot Status panel, the Android app, or directly:
+
+```
+ssh tradebot@<ip> 'curl -s -X POST http://127.0.0.1:8502/api/paper/bot/start'
+```
+
+Runs run_paper_trading.py against the same crypto market scope as the live
+bot, using the ORIGINAL CryptoTechnicalStrategy configuration, unchanged --
+a live A/B control for whatever strategy the real-money bot is running (see
+docs/ALGORITHM.md). Simulated only: no POST method exists anywhere in this
+repo for real orders, so this can never place one regardless of what the
+strategy decides.
 
 ## 7. Set up Caddy (HTTPS + password)
 

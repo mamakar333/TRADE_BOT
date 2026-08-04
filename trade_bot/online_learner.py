@@ -37,7 +37,20 @@ FEATURE_NAMES = [
     "minutes_to_close_scaled",
     "entry_price_scaled",
     "side_is_yes",
+    # Added 2026-08-04 (the "underwriter" expansion): asset and time-of-day
+    # were the two most obvious real signals the model had no way to use
+    # before -- every trade got folded into one undifferentiated pool
+    # regardless of whether it was BTC/ETH/BNB or 3am/3pm. Cyclical
+    # (sin/cos) hour encoding avoids the discontinuity a raw 0-23 value
+    # would have at the 23->0 wraparound.
+    "hour_sin",
+    "hour_cos",
+    "asset_btc",
+    "asset_eth",
 ]
+
+_BTC_PREFIXES = ("KXBTC15M-", "KXBTCD-")
+_ETH_PREFIXES = ("KXETH15M-", "KXETHD-")
 
 
 def build_features(
@@ -50,11 +63,14 @@ def build_features(
     minutes_to_close: float | None,
     entry_price_pct: float,
     side: str,
+    hour_utc: int | None = None,
+    ticker: str = "",
 ) -> dict[str, float]:
     """Raw signal values the strategy already computed for its own decision,
     rescaled to roughly [-1, 1] with FIXED divisors (not online-normalized)
     -- fixed scaling means a handful of early examples can't distort what
     "large" means for every example after."""
+    hour_angle = 2 * math.pi * (hour_utc or 0) / 24
     return {
         "short_delta_scaled": short_delta / 5.0,
         "long_delta_scaled": (long_delta or 0.0) / 10.0,
@@ -64,6 +80,10 @@ def build_features(
         "minutes_to_close_scaled": (minutes_to_close if minutes_to_close is not None else 30.0) / 60.0,
         "entry_price_scaled": entry_price_pct / 100.0,
         "side_is_yes": 1.0 if side == "YES" else 0.0,
+        "hour_sin": math.sin(hour_angle) if hour_utc is not None else 0.0,
+        "hour_cos": math.cos(hour_angle) if hour_utc is not None else 0.0,
+        "asset_btc": 1.0 if ticker.startswith(_BTC_PREFIXES) else 0.0,
+        "asset_eth": 1.0 if ticker.startswith(_ETH_PREFIXES) else 0.0,
     }
 
 

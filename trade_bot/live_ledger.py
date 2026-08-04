@@ -88,6 +88,7 @@ class LiveTrade:
     close_reason: str | None
     status: str
     features_json: str | None = None
+    entry_kind: str | None = None
 
 
 class LiveLedger:
@@ -107,6 +108,14 @@ class LiveLedger:
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(live_trades)").fetchall()}
         if "features_json" not in cols:
             self._conn.execute("ALTER TABLE live_trades ADD COLUMN features_json TEXT")
+        # Added 2026-08-04: tags which entry path opened a position (e.g.
+        # "scalp", "gamble") so exit logic can apply different rules per
+        # entry type -- see strategy.py's _evaluate_special_exit. Kept
+        # separate from features_json on purpose: that blob feeds the online
+        # learner's dot-product directly (see OnlineLogisticLearner.update),
+        # and a non-numeric string value there would break it.
+        if "entry_kind" not in cols:
+            self._conn.execute("ALTER TABLE live_trades ADD COLUMN entry_kind TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -122,14 +131,15 @@ class LiveLedger:
         order_id: str | None,
         client_order_id: str | None,
         features_json: str | None = None,
+        entry_kind: str | None = None,
     ) -> LiveTrade:
         cur = self._conn.execute(
             """INSERT INTO live_trades
                (ticker, side, quantity, entry_price_pct, entry_fee, opened_at,
-                strategy_name, open_order_id, open_client_order_id, status, features_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+                strategy_name, open_order_id, open_client_order_id, status, features_json, entry_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
             (ticker, side, quantity, entry_price_pct, entry_fee, _now(), strategy_name, order_id, client_order_id,
-             features_json),
+             features_json, entry_kind),
         )
         self._conn.commit()
         return self.get_open_trade(ticker)
@@ -163,9 +173,10 @@ class LiveLedger:
         )
         self._conn.commit()
 
-    def get_closed_trades(self, limit: int = 500) -> list[LiveTrade]:
+    def get_closed_trades(self, limit: int = 500, offset: int = 0) -> list[LiveTrade]:
         rows = self._conn.execute(
-            "SELECT * FROM live_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM live_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
         return [LiveTrade(**dict(r)) for r in rows]
 

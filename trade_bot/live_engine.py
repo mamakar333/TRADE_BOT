@@ -106,6 +106,16 @@ class LiveRiskLimits:
     max_position_size_dollars: float
     low_balance_fraction: float = 0.25
     daily_stop_loss_dollars: float = 35.0
+    # Added 2026-08-04 per explicit user request: disable the automatic
+    # daily-loss pause entirely, so the strategy keeps trading (and the
+    # online learner keeps getting labeled examples) through a losing day
+    # instead of going idle until UTC midnight. The user is taking over
+    # this control manually via the dashboard/app Stop button instead.
+    # daily_stop_loss_dollars is left in place and still SHOWN in both UIs
+    # for awareness -- this flag only controls whether it actually blocks
+    # anything. max_capital_dollars/max_position_size_dollars (the per-
+    # trade and total sizing caps) are unrelated and still fully enforced.
+    daily_kill_switch_enabled: bool = True
 
 
 class LiveExecutionEngine:
@@ -286,11 +296,22 @@ class LiveExecutionEngine:
             self._log(event="positions_fetch_error", error=str(e))
             return
 
-        # Union, not just the watchlist: a rotating market can roll off the
-        # resolved watchlist while a position is still open in it (e.g. it
-        # was still tradeable when opened, expired since) -- that position
-        # must keep getting evaluated so it can still be closed.
-        tickers_to_check = set(watchlist) | {p.ticker for p in real_positions}
+        # Union of three things, not just the watchlist:
+        # 1. The resolved watchlist itself.
+        # 2. Real exchange positions -- a rotating market can roll off the
+        #    watchlist while a position is still open in it (e.g. it was
+        #    still tradeable when opened, expired since); it must keep
+        #    getting evaluated so it can still be closed.
+        # 3. Tickers the LEDGER still thinks are open -- found live
+        #    2026-08-04: without this, a ticker that rotates off the
+        #    watchlist AND has already closed on the exchange (so it's in
+        #    neither #1 nor #2) never gets visited again, so its ledger row
+        #    never gets reconciled -- it just sits there marked "open"
+        #    forever, silently inflating open-position counts in the
+        #    dashboard/app even though there's no real exposure at all.
+        tickers_to_check = (
+            set(watchlist) | {p.ticker for p in real_positions} | {t.ticker for t in self.ledger.get_all_open_trades()}
+        )
 
         # Mutable and shared across this whole cycle -- _act() adds to it the
         # moment a fill actually happens, so a second correlated ticker
@@ -350,6 +371,7 @@ class LiveExecutionEngine:
                     entry_fee=ledger_open.entry_fee if ledger_open else 0.0,
                     opened_at=ledger_open.opened_at if ledger_open else datetime.now(timezone.utc).isoformat(),
                     strategy_name=self.strategy.name,
+                    entry_kind=ledger_open.entry_kind if ledger_open else None,
                 )
 
             decision = self.strategy.evaluate(snapshot, history, position)
@@ -391,7 +413,7 @@ class LiveExecutionEngine:
                 return
 
             daily_pnl = self._daily_realized_pnl()
-            if daily_pnl <= -self.risk_limits.daily_stop_loss_dollars:
+            if self.risk_limits.daily_kill_switch_enabled and daily_pnl <= -self.risk_limits.daily_stop_loss_dollars:
                 self._log(
                     event="risk_blocked", ticker=ticker,
                     reason=f"daily stop-loss hit (realized P&L today {daily_pnl:.2f} <= "
@@ -477,6 +499,7 @@ class LiveExecutionEngine:
             self.ledger.record_open(
                 ticker, side, fill_count, fill_price_pct, total_fee, self.strategy.name,
                 resp.get("order_id"), client_order_id, features_json=features_json,
+                entry_kind=decision.entry_kind,
             )
             open_underlyings.add(asset)
             self._log(
@@ -554,11 +577,12 @@ class LiveExecutionEngine:
                 reason=decision.reason,
             )
             pnl_note = f"${realized_pnl:+.2f}" if realized_pnl is not None else "unknown pnl"
+            won = (realized_pnl or 0) >= 0
             send_notification(
                 self.notify_topic,
-                f"{'✅' if (realized_pnl or 0) >= 0 else '❌'} Closed {real_pos.side} on {ticker}: {pnl_note}",
-                decision.reason,
-                priority="default" if (realized_pnl or 0) >= 0 else "high",
+                f"{'WIN' if won else 'LOSS'}: Closed {real_pos.side} on {ticker} ({pnl_note})",
+                f"{'✅' if won else '❌'} {decision.reason}",
+                priority="default" if won else "high",
             )
 
     def run_forever(self, interval_seconds: float = 20.0) -> None:

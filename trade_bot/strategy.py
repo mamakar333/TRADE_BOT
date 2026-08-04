@@ -79,6 +79,12 @@ class StrategyDecision:
     # None elsewhere -- exits, HOLDs, and strategies that don't build features
     # just don't participate in the live learning gate.
     features: dict[str, float] | None = None
+    # Tags which entry path produced this BUY (e.g. "scalp", "gamble") so the
+    # engine can persist it on the ledger row and exit logic can later apply
+    # different rules per entry type. None means the strategy's standard
+    # entry path -- unset by every strategy that doesn't have multiple entry
+    # types.
+    entry_kind: str | None = None
 
 
 def force_settle_exit(snapshot: MarketSnapshot, position: Position) -> StrategyDecision:
@@ -263,6 +269,10 @@ class _TakeProfitStopLossStrategy(Strategy):
     def _evaluate_exit(
         self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot]
     ) -> StrategyDecision:
+        special = self._evaluate_special_exit(snapshot, position, history)
+        if special is not None:
+            return special
+
         mark = snapshot.yes_bid_pct if position.side == "YES" else snapshot.no_bid_pct
         if mark is None:
             return StrategyDecision(Signal.HOLD, reason=f"no {position.side} bid available to mark position")
@@ -292,9 +302,13 @@ class _TakeProfitStopLossStrategy(Strategy):
         # Time-decay urgency: get out before a short-lived market forces a
         # settlement-price exit, which is the single biggest loss driver we
         # found. If already losing, cut it now rather than risk it going to 0;
-        # if flat/winning, take what's on the table.
+        # if flat/winning, take what's on the table. urgency_window is a hook
+        # (default: the fixed urgency_minutes) so a subclass can widen it
+        # per-ticker -- see DataDrivenCryptoStrategy's wider buffer on 15min
+        # markets, where forced-settlement losses were concentrated.
         minutes_left = snapshot.minutes_to_close
-        if minutes_left is not None and minutes_left <= self.urgency_minutes:
+        urgency_window = self._urgency_minutes_for(snapshot)
+        if minutes_left is not None and minutes_left <= urgency_window:
             return StrategyDecision(
                 Signal.SELL,
                 size=position.quantity,
@@ -309,24 +323,30 @@ class _TakeProfitStopLossStrategy(Strategy):
         # much of that peak -- lets a winner run toward 10%+ while momentum
         # still favors it, but locks in gains the moment it turns instead of
         # waiting for a fixed ceiling (or letting it round-trip back to a loss).
+        # giveback_tolerance/profit_ceiling are hooks (default: the fixed
+        # trail_giveback_pct/max_profit_pct below) -- CryptoTechnicalStrategy
+        # overrides them to widen both while a position is still trending
+        # favorably on a 15-min market, see momentum_hold_enabled.
         peak_return = self._peak_favorable_return(history, position, mark)
+        giveback_tolerance = self._trail_giveback_tolerance(snapshot, position, history, peak_return)
+        profit_ceiling = self._profit_ceiling(snapshot, position, history, peak_return)
         if peak_return >= self.trail_activate_pct:
             giveback = peak_return - pct_return
-            if giveback >= self.trail_giveback_pct:
+            if giveback >= giveback_tolerance:
                 return StrategyDecision(
                     Signal.SELL,
                     size=position.quantity,
                     reason=(
                         f"{position.side} peaked at +{peak_return:.1%}, now {pct_return:+.1%} "
-                        f"(gave back {giveback:.1%}) -- trailing stop locking in gains"
+                        f"(gave back {giveback:.1%} >= {giveback_tolerance:.0%} tolerance) -- trailing stop locking in gains"
                     ),
                 )
 
-        if pct_return >= self.max_profit_pct:
+        if pct_return >= profit_ceiling:
             return StrategyDecision(
                 Signal.SELL,
                 size=position.quantity,
-                reason=f"{position.side} at {pct_return:+.1%} hit max_profit_pct ({self.max_profit_pct:.0%}) cap",
+                reason=f"{position.side} at {pct_return:+.1%} hit profit ceiling ({profit_ceiling:.0%})",
             )
 
         return StrategyDecision(
@@ -337,6 +357,40 @@ class _TakeProfitStopLossStrategy(Strategy):
                 f"{position.side} at {pct_return:+.1%} return (peak {peak_return:+.1%})"
             ),
         )
+
+    def _evaluate_special_exit(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot]
+    ) -> StrategyDecision | None:
+        """Hook for subclasses with entry-kind-specific exit rules (e.g.
+        CryptoTechnicalStrategy's scalp/gamble entries, which skip the
+        standard stop-loss/trailing/time-decay logic below entirely).
+        Returning None (the default) means "no special handling, use the
+        standard path" -- every existing strategy is unaffected."""
+        return None
+
+    def _trail_giveback_tolerance(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot], peak_return: float
+    ) -> float:
+        """How much of the peak favorable return can be given back before the
+        trailing stop locks in gains. Hook so a subclass can widen this
+        dynamically (e.g. while a position is still trending favorably);
+        default is just the fixed trail_giveback_pct, identical to the
+        original behavior."""
+        return self.trail_giveback_pct
+
+    def _profit_ceiling(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot], peak_return: float
+    ) -> float:
+        """Hard profit cap paired with _trail_giveback_tolerance above --
+        same hook pattern, default is the fixed max_profit_pct."""
+        return self.max_profit_pct
+
+    def _urgency_minutes_for(self, snapshot: MarketSnapshot) -> float:
+        """How much time-to-close triggers the time-decay urgency exit.
+        Hook so a subclass can widen this per-ticker (e.g. more buffer on a
+        15-min rotating market than an hourly one); default is the fixed
+        urgency_minutes, identical to the original behavior."""
+        return self.urgency_minutes
 
     @staticmethod
     def _peak_favorable_return(history: list[MarketSnapshot], position: Position, current_mark: float) -> float:
@@ -487,6 +541,22 @@ class CryptoTechnicalStrategy(_TakeProfitStopLossStrategy):
         micro_bet_max_move_pct: float = 6.0,
         stop_loss_time_bonus_pct: float = 0.0,
         stop_loss_time_reference_minutes: float = 60.0,
+        scalp_enabled: bool = False,
+        scalp_window_seconds: float = 45.0,
+        scalp_threshold_pct: float = 1.5,
+        scalp_dollars: float = 3.0,
+        scalp_take_profit_pct: float = 0.06,
+        scalp_stop_loss_pct: float = 0.08,
+        scalp_max_hold_minutes: float = 2.5,
+        momentum_hold_enabled: bool = False,
+        momentum_hold_confirm_minutes: float = 1.0,
+        momentum_hold_confirm_pct: float = 0.5,
+        momentum_hold_giveback_pct: float = 0.08,
+        momentum_hold_max_profit_pct: float = 0.50,
+        gamble_enabled: bool = False,
+        gamble_dollars: float = 1.5,
+        gamble_min_confidence: float = 2.0,
+        gamble_catastrophic_stop_pct: float = 0.90,
     ):
         self.short_window_minutes = short_window_minutes
         self.long_window_minutes = long_window_minutes
@@ -529,6 +599,63 @@ class CryptoTechnicalStrategy(_TakeProfitStopLossStrategy):
         # move as noise rather than signal.
         self.micro_bet_max_move_pct = micro_bet_max_move_pct
 
+        # Added 2026-08-04 per explicit user request, all opt-in (OFF by
+        # default) and scoped to the three rotating 15-min series
+        # (KXBTC15M/KXETH15M/KXBNB15M -- see _is_short_duration) since the
+        # strict multi-timeframe signal above is mathematically unable to
+        # fire on those three (12min long window vs a 15min market life,
+        # see run_live_trading.py's STRATEGY_PARAMS comment) -- only the
+        # micro-bet fallback ever traded them before this.
+        #
+        # Scalp: a much shorter (default 45s) lookback than even the
+        # micro-bet's 3min short window, for a genuine "just spiked" move the
+        # normal signal is too slow to react to. Own fast exit (see
+        # _evaluate_scalp_exit) -- deliberately NOT the shared trailing-stop
+        # logic, since the whole point is fast in/out, not letting it run.
+        self.scalp_enabled = scalp_enabled
+        self.scalp_window_seconds = scalp_window_seconds
+        self.scalp_threshold_pct = scalp_threshold_pct
+        self.scalp_dollars = scalp_dollars
+        self.scalp_take_profit_pct = scalp_take_profit_pct
+        self.scalp_stop_loss_pct = scalp_stop_loss_pct
+        self.scalp_max_hold_minutes = scalp_max_hold_minutes
+
+        # Momentum-hold: widens the shared trailing-stop's giveback tolerance
+        # and profit ceiling (see _trail_giveback_tolerance/_profit_ceiling
+        # overrides below) for a standard (non-scalp, non-gamble) position
+        # on a 15-min market specifically while it's still trending
+        # favorably -- lets a genuinely continuing move run further before
+        # locking in, same "let winners run" idea the base trailing-stop
+        # already has, just less eager to lock in while momentum persists.
+        self.momentum_hold_enabled = momentum_hold_enabled
+        self.momentum_hold_confirm_minutes = momentum_hold_confirm_minutes
+        self.momentum_hold_confirm_pct = momentum_hold_confirm_pct
+        self.momentum_hold_giveback_pct = momentum_hold_giveback_pct
+        self.momentum_hold_max_profit_pct = momentum_hold_max_profit_pct
+
+        # Gamble: occasional, rate-limited, fixed-tiny-stake bet on a strong
+        # short-term signal that skips the stop-loss/trailing/time-decay exit
+        # logic entirely and holds to actual market settlement (see
+        # _evaluate_gamble_exit) -- a deliberate, capped-size reintroduction
+        # of the exact "held through forced settlement" pattern diagnosed
+        # 2026-07-12 as the strategy's single biggest historical loss driver
+        # (see MarketSnapshot.close_time's docstring), accepted here on
+        # purpose in exchange for a real shot at the full payout. Rate-limit
+        # is "every alternate qualifying signal per asset" (see
+        # _evaluate_gamble_bet) -- not every-other-poll, every-other actually
+        # -placed gamble-eligible trade, tracked in _gamble_due.
+        self.gamble_enabled = gamble_enabled
+        self.gamble_dollars = gamble_dollars
+        self.gamble_min_confidence = gamble_min_confidence
+        self.gamble_catastrophic_stop_pct = gamble_catastrophic_stop_pct
+        self._gamble_due: dict[str, bool] = {}
+
+    _SHORT_DURATION_PREFIXES = ("KXBTC15M-", "KXETH15M-", "KXBNB15M-")
+
+    @classmethod
+    def _is_short_duration(cls, ticker: str) -> bool:
+        return ticker.startswith(cls._SHORT_DURATION_PREFIXES)
+
     def _evaluate_entry(self, snapshot: MarketSnapshot, history: list[MarketSnapshot]) -> StrategyDecision:
         mid = snapshot.mid_pct
         if mid is None:
@@ -556,10 +683,19 @@ class CryptoTechnicalStrategy(_TakeProfitStopLossStrategy):
         agree_down = long_delta is not None and short_delta <= -self.threshold_pct and long_delta < 0
 
         if not (agree_up or agree_down):
+            short_duration = self._is_short_duration(snapshot.ticker)
+            if short_duration and self.gamble_enabled:
+                gamble_decision = self._evaluate_gamble_bet(snapshot, short_delta, volatility)
+                if gamble_decision is not None:
+                    return gamble_decision
             if self.micro_bet_enabled:
                 micro_decision = self._evaluate_micro_bet(snapshot, short_delta, volatility)
                 if micro_decision is not None:
                     return micro_decision
+            if short_duration and self.scalp_enabled:
+                scalp_decision = self._evaluate_scalp_entry(snapshot, history, volatility)
+                if scalp_decision is not None:
+                    return scalp_decision
             long_note = (
                 f"long {long_delta:+.1f}pp/{self.long_window_minutes}min"
                 if long_delta is not None
@@ -598,6 +734,7 @@ class CryptoTechnicalStrategy(_TakeProfitStopLossStrategy):
                 short_delta=short_delta, long_delta=long_delta, is_micro_bet=False,
                 volatility=volatility, orderbook_imbalance=snapshot.orderbook_imbalance,
                 minutes_to_close=snapshot.minutes_to_close, entry_price_pct=ask, side=side,
+                hour_utc=snapshot.timestamp.hour, ticker=snapshot.ticker,
             ),
         )
 
@@ -647,8 +784,220 @@ class CryptoTechnicalStrategy(_TakeProfitStopLossStrategy):
                 short_delta=short_delta, long_delta=None, is_micro_bet=True,
                 volatility=volatility, orderbook_imbalance=snapshot.orderbook_imbalance,
                 minutes_to_close=snapshot.minutes_to_close, entry_price_pct=ask, side=side,
+                hour_utc=snapshot.timestamp.hour, ticker=snapshot.ticker,
             ),
         )
+
+    def _evaluate_scalp_entry(
+        self, snapshot: MarketSnapshot, history: list[MarketSnapshot], volatility: float | None
+    ) -> StrategyDecision | None:
+        """Very short-fuse momentum entry: a real move inside the last
+        scalp_window_seconds (default 45s) -- short enough that the
+        strategy's normal 3min short window is too slow to catch it at all.
+        Own fast exit (_evaluate_scalp_exit), not the shared trailing-stop:
+        the whole point is fast in/out, not letting it run. Returns None
+        (not a HOLD decision) when the bar isn't met, same convention as
+        _evaluate_micro_bet, so the caller falls through cleanly."""
+        if snapshot.minutes_to_close is not None and snapshot.minutes_to_close < self.scalp_max_hold_minutes + 1.0:
+            # Not enough runway left to plausibly complete a scalp's own
+            # max-hold window before the strategy's own min_minutes_to_close
+            # guard would already be blocking new entries anyway -- this is
+            # a defensive extra margin, not the primary guard.
+            return None
+        if snapshot.mid_pct is None:
+            return None
+        cutoff = snapshot.timestamp - timedelta(seconds=self.scalp_window_seconds)
+        old_mid = self._mid_at_or_before(history, cutoff)
+        if old_mid is None:
+            return None
+        delta = snapshot.mid_pct - old_mid
+        if abs(delta) < self.scalp_threshold_pct:
+            return None
+
+        side = "YES" if delta > 0 else "NO"
+        ok, reject_reason = self._entry_price_ok(side, snapshot)
+        if not ok:
+            return None
+
+        ask = snapshot.yes_ask_pct if side == "YES" else snapshot.no_ask_pct
+        size = self._size_for_dollars(self.scalp_dollars, ask)
+        signal = Signal.BUY_YES if side == "YES" else Signal.BUY_NO
+        return StrategyDecision(
+            signal,
+            size=size,
+            reason=(
+                f"scalp: rapid {delta:+.1f}pp move in {self.scalp_window_seconds:.0f}s "
+                f">= {self.scalp_threshold_pct}pp bar -- fast in/out, ${self.scalp_dollars:.2f} stake"
+            ),
+            entry_kind="scalp",
+            features=build_features(
+                short_delta=delta, long_delta=None, is_micro_bet=True,
+                volatility=volatility, orderbook_imbalance=snapshot.orderbook_imbalance,
+                minutes_to_close=snapshot.minutes_to_close, entry_price_pct=ask, side=side,
+                hour_utc=snapshot.timestamp.hour, ticker=snapshot.ticker,
+            ),
+        )
+
+    def _evaluate_scalp_exit(self, snapshot: MarketSnapshot, position: Position) -> StrategyDecision:
+        """Fast, fixed take-profit/stop-loss plus a hard max-hold timer --
+        deliberately not the shared trailing-stop logic. A scalp is meant to
+        be in and out quickly regardless of how it's doing; letting one
+        linger flat defeats the point as much as letting one run a loss."""
+        mark = snapshot.yes_bid_pct if position.side == "YES" else snapshot.no_bid_pct
+        if mark is None:
+            return StrategyDecision(Signal.HOLD, reason=f"no {position.side} bid available to mark scalp position")
+        pct_return = (mark - position.entry_price_pct) / position.entry_price_pct
+
+        if pct_return <= -self.scalp_stop_loss_pct:
+            return StrategyDecision(
+                Signal.SELL, size=position.quantity,
+                reason=f"scalp {position.side} at {pct_return:+.1%} hit tight stop-loss (-{self.scalp_stop_loss_pct:.0%})",
+            )
+        if pct_return >= self.scalp_take_profit_pct:
+            return StrategyDecision(
+                Signal.SELL, size=position.quantity,
+                reason=f"scalp {position.side} at {pct_return:+.1%} hit quick take-profit ({self.scalp_take_profit_pct:.0%})",
+            )
+
+        held_minutes = 0.0
+        try:
+            opened_at = datetime.fromisoformat(position.opened_at)
+            held_minutes = (snapshot.timestamp - opened_at).total_seconds() / 60
+        except ValueError:
+            pass
+        if held_minutes >= self.scalp_max_hold_minutes:
+            return StrategyDecision(
+                Signal.SELL, size=position.quantity,
+                reason=(
+                    f"scalp {position.side} held {held_minutes:.1f}min >= max {self.scalp_max_hold_minutes}min "
+                    f"-- forcing quick exit regardless of {pct_return:+.1%} return"
+                ),
+            )
+        return StrategyDecision(
+            Signal.HOLD, reason=f"scalp {position.side} at {pct_return:+.1%}, held {held_minutes:.1f}min",
+        )
+
+    def _evaluate_gamble_bet(
+        self, snapshot: MarketSnapshot, short_delta: float, volatility: float | None
+    ) -> StrategyDecision | None:
+        """Occasional, rate-limited, fixed-tiny-stake bet on a strong
+        short-term signal -- see _evaluate_gamble_exit for what happens after
+        entry (holds to actual settlement, no stop-loss/trailing/time-decay
+        exit). Rate limit is "every alternate qualifying signal per asset":
+        _gamble_due tracks, per underlying asset, whether the next
+        gamble-eligible signal should actually be taken. Only a signal that
+        would actually be placed (passes the entry-price guard) consumes a
+        turn -- one that's rejected on price doesn't flip the alternation."""
+        confidence = abs(short_delta) / self.threshold_pct
+        if confidence < self.gamble_min_confidence:
+            return None
+
+        side = "YES" if short_delta > 0 else "NO"
+        ok, reject_reason = self._entry_price_ok(side, snapshot)
+        if not ok:
+            return None
+
+        asset = snapshot.ticker.split("-")[0]
+        if not self._gamble_due.get(asset, True):
+            # Last qualifying signal for this asset was taken as a gamble --
+            # sit this one out, but the NEXT qualifying one is due.
+            self._gamble_due[asset] = True
+            return None
+
+        ask = snapshot.yes_ask_pct if side == "YES" else snapshot.no_ask_pct
+        size = self._size_for_dollars(self.gamble_dollars, ask)
+        signal = Signal.BUY_YES if side == "YES" else Signal.BUY_NO
+        self._gamble_due[asset] = False
+        return StrategyDecision(
+            signal,
+            size=size,
+            reason=(
+                f"gamble bet: short-term move {short_delta:+.1f}pp/{self.short_window_minutes}min "
+                f"(confidence x{confidence:.1f} >= {self.gamble_min_confidence}) -- holding to expiry "
+                f"regardless of interim moves, ${self.gamble_dollars:.2f} stake"
+            ),
+            entry_kind="gamble",
+            features=build_features(
+                short_delta=short_delta, long_delta=None, is_micro_bet=True,
+                volatility=volatility, orderbook_imbalance=snapshot.orderbook_imbalance,
+                minutes_to_close=snapshot.minutes_to_close, entry_price_pct=ask, side=side,
+                hour_utc=snapshot.timestamp.hour, ticker=snapshot.ticker,
+            ),
+        )
+
+    def _evaluate_gamble_exit(self, snapshot: MarketSnapshot, position: Position) -> StrategyDecision:
+        """No stop-loss, no trailing, no time-decay urgency exit -- holds
+        through any drawdown until the market actually settles (the outer
+        evaluate() routes to force_settle_exit once the market goes
+        non-tradeable, independent of entry_kind). The one exception is a
+        catastrophic floor: even a deliberate gamble still cuts if it craters
+        almost completely, rather than being a truly bottomless bet."""
+        mark = snapshot.yes_bid_pct if position.side == "YES" else snapshot.no_bid_pct
+        if mark is None:
+            return StrategyDecision(Signal.HOLD, reason=f"no {position.side} bid available to mark gamble position")
+        pct_return = (mark - position.entry_price_pct) / position.entry_price_pct
+
+        if pct_return <= -self.gamble_catastrophic_stop_pct:
+            return StrategyDecision(
+                Signal.SELL, size=position.quantity,
+                reason=(
+                    f"gamble {position.side} at {pct_return:+.1%} hit catastrophic floor "
+                    f"(-{self.gamble_catastrophic_stop_pct:.0%}) -- cutting even a gamble bet here"
+                ),
+            )
+        return StrategyDecision(
+            Signal.HOLD, reason=f"gamble {position.side} at {pct_return:+.1%} -- holding to expiry regardless",
+        )
+
+    def _evaluate_special_exit(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot]
+    ) -> StrategyDecision | None:
+        if position.entry_kind == "scalp":
+            return self._evaluate_scalp_exit(snapshot, position)
+        if position.entry_kind == "gamble":
+            return self._evaluate_gamble_exit(snapshot, position)
+        return None
+
+    def _still_trending_favorably(
+        self, snapshot: MarketSnapshot, history: list[MarketSnapshot], position: Position
+    ) -> bool:
+        """Has the price kept moving in the position's favor over the last
+        momentum_hold_confirm_minutes? Used by the momentum-hold hooks below
+        to decide whether to give a winner more room instead of locking in
+        early -- a real (if noisy) continuation check, not just "is it still
+        up overall"."""
+        cutoff = snapshot.timestamp - timedelta(minutes=self.momentum_hold_confirm_minutes)
+        old_mid = self._mid_at_or_before(history, cutoff)
+        if old_mid is None or snapshot.mid_pct is None:
+            return False
+        delta = snapshot.mid_pct - old_mid
+        if position.side == "YES":
+            return delta >= self.momentum_hold_confirm_pct
+        return delta <= -self.momentum_hold_confirm_pct
+
+    def _momentum_hold_active(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot]
+    ) -> bool:
+        return (
+            self.momentum_hold_enabled
+            and position.entry_kind not in ("scalp", "gamble")
+            and self._is_short_duration(snapshot.ticker)
+            and self._still_trending_favorably(snapshot, history, position)
+        )
+
+    def _trail_giveback_tolerance(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot], peak_return: float
+    ) -> float:
+        if self._momentum_hold_active(snapshot, position, history):
+            return self.momentum_hold_giveback_pct
+        return self.trail_giveback_pct
+
+    def _profit_ceiling(
+        self, snapshot: MarketSnapshot, position: Position, history: list[MarketSnapshot], peak_return: float
+    ) -> float:
+        if self._momentum_hold_active(snapshot, position, history):
+            return self.momentum_hold_max_profit_pct
+        return self.max_profit_pct
 
 
 class SportsMicrostructureStrategy(_TakeProfitStopLossStrategy):

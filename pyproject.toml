@@ -5,7 +5,9 @@ description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=49.0.0",
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.2",
     "streamlit>=1.59.1",
+    "uvicorn>=0.30.0",
 ]

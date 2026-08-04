@@ -59,81 +59,104 @@ import sys
 from trade_bot.adaptive import AdaptiveConfig, PerformanceGovernor
 from trade_bot.bot_control import CONFIRMATION_PHRASE, remove_pidfile, write_pidfile
 from trade_bot.client import KalshiClient
+from trade_bot.data_driven_strategy import DataDrivenCryptoStrategy
 from trade_bot.live_engine import LiveExecutionEngine, LiveRiskLimits
 from trade_bot.live_ledger import LiveLedger
 from trade_bot.online_learner import OnlineLogisticLearner
-from trade_bot.strategy import CryptoTechnicalStrategy
 from trade_bot.watchlist import ACTIVE_CRYPTO_SERIES_PREFIXES, build_crypto_watchlist
 
 INTERVAL_SECONDS = 20
 
-# Same instrument scope as the paper bot's crypto_technical strategy, but
-# sized for a $100 real-money account and with min_minutes_to_close raised
-# above the strategy default (5min) -- the single biggest fix from the loss
-# diagnosis, and worth being more conservative on with real money than the
-# 5min default used in paper trading.
+# Exposed so app.py/api.py can look up THIS strategy's governor/ledger stats
+# by the right name dynamically (governor.evaluate(STRATEGY_NAME)) instead
+# of a second hardcoded copy of the string that would silently go stale on
+# the next rewrite, the way "crypto_technical" almost did on this one.
+STRATEGY_NAME = DataDrivenCryptoStrategy.name
+
+# Replaced 2026-08-04 (CryptoTechnicalStrategy -> DataDrivenCryptoStrategy)
+# per explicit user request: "completely rewrite the algorithm based on the
+# collected data" -- see docs/ALGORITHM.md for the full writeup. Short
+# version: validated against all 329 real closed live trades so far
+# (122W/207L, 37.1% win rate, -$136.14), which showed the OLD strategy's core
+# premise (momentum continuation, confirmed by two-timeframe agreement)
+# barely predicts outcomes at all in a fitted logistic regression, while
+# order-book imbalance (never used to drive an entry before) and volatility
+# (previously only a size dampener) are the strongest real signals available.
+# CryptoTechnicalStrategy itself is UNCHANGED and still runs, unmodified, in
+# run_paper_trading.py -- the explicit A/B control for this rewrite, per the
+# same request ("dont change the paper bots algorithm").
 #
-# Note on long_window_minutes=12 + min_minutes_to_close=6: on a 15-minute
-# rotating market (KXBTC15M/KXETH15M/KXBNB15M) this makes the STRICT signal's
-# feasible entry window mathematically empty (needs t>=12min into the
-# market's life, but can't enter past t=9min) -- confirmed 2026-08-03. On
-# those three series only the micro-bet fallback below can ever fire; the
-# strict signal is fully operative on the hourly KXBTCD/KXETHD strikes,
-# which have plenty of room (feasible window t=12 to t=54min). Left
-# unchanged rather than shrinking long_window_minutes, since these values
-# came from the original loss diagnosis and the hourly series now give the
-# strict signal a real home without weakening it anywhere.
+# Note on why the three 15-min series (KXBTC15M/KXETH15M/KXBNB15M) still
+# lean on scalp as their primary mechanism: a 15-min market's whole life is
+# too short for a meaningful longer-window read, the same constraint that
+# made the old strategy's strict multi-timeframe signal mathematically
+# unable to fire there at all (needs t>=12min into the market's life, can't
+# enter past min_minutes_to_close=6min remaining). scalp's own 45s window
+# sidesteps that; it was real data's best performer of any signal (55% win
+# rate) and is kept structurally as-is, just re-costed (larger stake/target)
+# to clear fee drag against its small size -- see docs/ALGORITHM.md.
 STRATEGY_PARAMS = dict(
     short_window_minutes=3.0,
     long_window_minutes=12.0,
-    threshold_pct=2.0,
     base_dollars=25.0,
     max_dollars=30.0,
-    stop_loss_pct=0.15,
+    # Primary direction signal -- see docs/ALGORITHM.md's "why imbalance,
+    # not momentum" section. 0.12 is a real, not arbitrary, floor: bucketed
+    # against the historical data, |imbalance| below this had no
+    # meaningfully different win rate than noise.
+    min_imbalance_pct=0.12,
+    momentum_conflict_tolerance_pct=1.5,
+    # Hard gate (not just a dampener like the old strategy's volatility
+    # handling) -- bucketed win rate drops close to monotonically from
+    # ~43% under 2pp to ~25-31% above 6pp in the historical data.
+    max_volatility_pct=6.5,
+    # Absolute predicted-win-probability gate from a batch-fit logistic
+    # regression (trade_bot/data_driven_strategy.py's PROBABILITY_MODEL_*
+    # constants), calibrated against a chronological 20% holdout: the full
+    # combined gate (imbalance floor + volatility ceiling + this threshold)
+    # took 16/63 holdout trades (25%) at 56.2% win rate, vs. 41.3% for all
+    # 63 -- real, if modest, out-of-sample separation. See
+    # refit_strategy_model.py to regenerate these constants later as more
+    # real trades accumulate.
+    min_win_probability=0.43,
+    min_entry_price_pct=45.0,
+    max_entry_price_pct=85.0,
+    min_minutes_to_close=6.0,
+    # Tightened from the old strategy's 0.15 base / up-to-0.25 widened.
+    # Single largest lever the data analysis found: stop-losses fired at a
+    # -28.0% average realized return, far wider than winners were ever
+    # allowed to run (trailing-stop averaged ~+5-20%) -- losers were simply
+    # given much more room than winners, a losing combination at a sub-40%
+    # win rate no matter how good the entry signal is.
+    stop_loss_pct=0.10,
+    stop_loss_time_bonus_pct=0.05,
+    stop_loss_time_reference_minutes=60.0,
     trail_activate_pct=0.05,
     trail_giveback_pct=0.03,
     max_profit_pct=0.25,
     urgency_minutes=3.0,
-    max_entry_price_pct=85.0,
-    # Added 2026-08-03: win rate climbed steadily with entry price across
-    # every cutoff tested on 35 real trades (e.g. below 45c: 1W/15L, 6%;
-    # at/above 45c: 3W/17L, 15%) -- buying the side the market already
-    # considers the underdog performed consistently worse. Honest caveat:
-    # even above this floor, real win rate is still well under breakeven --
-    # this removes the worst-performing slice, it is not a fix that makes
-    # the signal profitable by itself.
-    min_entry_price_pct=45.0,
-    min_minutes_to_close=6.0,
-    # Added 2026-08-03 per explicit user request: the strict multi-timeframe
-    # signal above is intentionally rare (that's what fixed the paper-trading
-    # losses), so the account could sit idle for a long time. This is an
-    # opt-in looser fallback -- still a real signal (short-term momentum),
-    # just a much lower bar -- capped at $1-4 per trade specifically so
-    # accepting more/weaker signals can never risk more than pocket change
-    # per trade. Same exit logic, same min_minutes_to_close/entry-price
-    # guards, same daily kill-switch, same PerformanceGovernor as every other
-    # trade this strategy makes.
-    micro_bet_enabled=True,
-    micro_bet_min_dollars=1.0,
-    micro_bet_max_dollars=4.0,
-    micro_bet_threshold_pct=0.5,
-    # Added 2026-08-03 after diagnosing the first 11 real micro-bet trades
-    # (1W/10L, -$8.63): every loss hit the hard stop-loss within 0-1.8min,
-    # and the two worst losses (-50%, -26%) came from chasing the two most
-    # extreme moves seen (-28.5pp, -48pp/3min) -- almost certainly thin-book
-    # spikes that had already happened, not real momentum. Caps how large a
-    # move the micro-bet will still treat as signal rather than noise.
-    micro_bet_max_move_pct=6.0,
-    # Added 2026-08-03: every real loss so far closed within 0-3.3min on a
-    # fixed -15% stop-loss that didn't account for how much time was left --
-    # a -15% move with 55 minutes left has real room to reverse before the
-    # market resolves, the same move with 2 minutes left doesn't. Widens the
-    # stop tolerance up to -25% when there's a full hour still ahead,
-    # tightening back to -15% as expiry approaches. Catastrophic moves
-    # (-30%+) still cut regardless of time left -- this only gives genuinely
-    # recoverable-looking drawdowns more room, it doesn't remove the floor.
-    stop_loss_time_bonus_pct=0.10,
-    stop_loss_time_reference_minutes=60.0,
+    # Extra buffer on the three 15-min series specifically -- of 41
+    # reconciled/forced-settlement trades in the historical data (9.8% win
+    # rate, -$89.72, the second-biggest loss source after stop-losses),
+    # 14 of 15 were on these three tickers. Defense in depth alongside (not
+    # instead of) the bot-watchdog fix for the downtime that caused most of
+    # the worst individual cases.
+    urgency_minutes_15min_bonus=1.5,
+    scalp_enabled=True,
+    scalp_window_seconds=45.0,
+    scalp_threshold_pct=1.5,
+    scalp_dollars=5.0,
+    scalp_take_profit_pct=0.08,
+    scalp_stop_loss_pct=0.08,
+    scalp_max_hold_minutes=2.5,
+    momentum_hold_enabled=True,
+    momentum_hold_confirm_minutes=1.0,
+    momentum_hold_confirm_pct=0.5,
+    momentum_hold_giveback_pct=0.08,
+    momentum_hold_max_profit_pct=0.50,
+    # No gamble_* parameters -- the mechanism doesn't exist in this
+    # strategy at all (not disabled, not present). Real data: 0-for-41,
+    # -$31.57, an unambiguous failure. Not carried forward.
 )
 
 GOVERNOR_CONFIG = AdaptiveConfig(
@@ -165,6 +188,14 @@ RISK_LIMITS = LiveRiskLimits(
     max_position_size_dollars=100.0,
     low_balance_fraction=0.25,
     daily_stop_loss_dollars=35.0,
+    # Disabled 2026-08-04 per explicit user request: keep trading through a
+    # losing day instead of auto-pausing, so the online learner keeps
+    # getting real labeled examples faster. The user is taking over this
+    # control manually via the dashboard/app Stop button instead. The $35
+    # figure and its progress bar stay visible in both UIs for awareness --
+    # this only controls whether it actually blocks new entries. Per-trade
+    # ($100) and total ($100) sizing caps above are unrelated and unchanged.
+    daily_kill_switch_enabled=False,
 )
 
 # Added 2026-08-03 per explicit user request: a live-updating model, not
@@ -174,8 +205,25 @@ RISK_LIMITS = LiveRiskLimits(
 # MIN_TRADES_FOR_ML_GATE since real trading won't produce enough labeled
 # examples to learn anything meaningful for a while. Persisted in
 # live_trading.db so it keeps whatever it's learned across restarts.
+#
+# Threshold temporarily dropped to 0.0 on 2026-08-04: after a real losing
+# stretch (31% win rate over the last 29 learner-fed trades), the model's
+# bias term went sharply negative while its per-feature (momentum) weights
+# were still too small after only 48 updates to meaningfully discriminate
+# good setups from bad -- so it was outputting a near-uniform ~35% on
+# almost every candidate and the 0.40 gate blocked 97% of all signals for
+# 6+ hours straight (1081/1117), effectively halting the bot. User chose to
+# disable the hard block rather than sit idle waiting for it to recover.
+# This does NOT disable the model: predict_proba() below still runs and
+# still *dampens* size via ml_multiplier (min sizing floor 0.5x stays in
+# effect), and every real close still feeds _update_learner() exactly as
+# before -- only the hard veto (`if p_win < threshold: return`) is
+# neutralized, since sigmoid output is always >= 0.0. Governor and all hard
+# risk limits (capital/position caps, per-trade sizing) are unaffected.
+# Restore to 0.40 (or reassess) once the model has enough fresh real
+# outcomes to actually differentiate rather than reflect one bad patch.
 MIN_TRADES_FOR_ML_GATE = 20
-ML_GATE_THRESHOLD = 0.40
+ML_GATE_THRESHOLD = 0.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
 
@@ -216,7 +264,7 @@ def main() -> None:
     write_pidfile()
 
     ledger = LiveLedger()
-    strategy = CryptoTechnicalStrategy(**STRATEGY_PARAMS)
+    strategy = DataDrivenCryptoStrategy(**STRATEGY_PARAMS)
     governor = PerformanceGovernor(
         lambda name, limit: ledger.get_recent_realized_pnls_within_hours(name, limit, GOVERNOR_LOOKBACK_HOURS),
         GOVERNOR_CONFIG,

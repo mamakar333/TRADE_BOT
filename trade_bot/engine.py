@@ -304,8 +304,12 @@ class ExecutionEngine:
                 return
 
             fee = taker_fee_dollars(decision.size, fill_price)
+            features_json = json.dumps(decision.features) if decision.features is not None else None
             try:
-                self.portfolio.open_position(ticker, side, decision.size, fill_price, fee, strategy.name)
+                self.portfolio.open_position(
+                    ticker, side, decision.size, fill_price, fee, strategy.name,
+                    features_json=features_json, entry_kind=decision.entry_kind,
+                )
             except ValueError as e:
                 self._log(event="fill_error", ticker=ticker, reason=str(e))
                 return

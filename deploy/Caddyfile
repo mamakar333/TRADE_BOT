@@ -12,5 +12,12 @@
 		output file /var/log/caddy/access.log
 	}
 
+	# The native Android app talks to the JSON API (api.service, :8502);
+	# everything else (browsers) goes to the Streamlit dashboard (:8501).
+	# Same password gates both -- basic_auth above applies to the whole
+	# site, this only decides which backend handles the request.
+	@api path /api/*
+	reverse_proxy @api 127.0.0.1:8502
+
 	reverse_proxy 127.0.0.1:8501
 }

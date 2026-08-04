@@ -267,3 +267,56 @@ def get_available_balance_dollars(client: KalshiClient) -> float:
     if "balance_dollars" in raw:
         return float(raw["balance_dollars"])
     return float(raw.get("balance", 0)) / 100
+
+
+@dataclass
+class CashFlowSummary:
+    total_deposited_gross_dollars: float
+    total_deposit_fees_dollars: float
+    total_deposited_net_dollars: float
+    total_withdrawn_dollars: float
+    deposit_count: int
+    withdrawal_count: int
+
+
+def get_cash_flow_summary(client: KalshiClient, max_pages: int = 10) -> CashFlowSummary:
+    """Real deposit/withdrawal history (GET /portfolio/deposits,
+    /portfolio/withdrawals) -- this is money moved in/out of the account
+    itself, separate from and not to be confused with trading P&L. Only
+    'applied' entries count (funds actually reflected in balance; pending/
+    failed/returned ones haven't, or won't). Paginated; bounded at
+    max_pages (100/page) so one status check can't run away on a very long
+    history.
+    """
+    def _sum(endpoint: str, key: str) -> tuple[float, float, int]:
+        gross = 0
+        fees = 0
+        count = 0
+        cursor: str | None = None
+        for _ in range(max_pages):
+            params: dict[str, Any] = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.get(endpoint, params=params, signed=True)
+            entries = page.get(key, [])
+            for e in entries:
+                if e.get("status") == "applied":
+                    gross += e.get("amount_cents", 0)
+                    fees += e.get("fee_cents", 0)
+                    count += 1
+            cursor = page.get("cursor") or None
+            if not cursor or not entries:
+                break
+        return gross / 100, fees / 100, count
+
+    dep_gross, dep_fees, dep_count = _sum("/portfolio/deposits", "deposits")
+    wd_gross, _wd_fees, wd_count = _sum("/portfolio/withdrawals", "withdrawals")
+
+    return CashFlowSummary(
+        total_deposited_gross_dollars=dep_gross,
+        total_deposit_fees_dollars=dep_fees,
+        total_deposited_net_dollars=dep_gross - dep_fees,
+        total_withdrawn_dollars=wd_gross,
+        deposit_count=dep_count,
+        withdrawal_count=wd_count,
+    )

@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS closed_trades (
     strategy_name TEXT NOT NULL,
     close_reason TEXT NOT NULL
 );
+-- entry_kind/features_json added via migration below, same columns as
+-- live_ledger.py's live_trades -- kept identical on purpose so paper and
+-- live trade history can be compared/analyzed with the same code once
+-- there's enough paper data to be worth it (see docs/ALGORITHM.md).
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +95,15 @@ class Position:
     entry_fee: float
     opened_at: str
     strategy_name: str
+    # Tags which entry path opened this position (e.g. "scalp", "gamble") --
+    # None means the strategy's normal/standard entry logic. Lets exit logic
+    # apply different rules per entry type (see strategy.py's
+    # _evaluate_special_exit).
+    entry_kind: str | None = None
+    # Entry-time feature snapshot (see online_learner.py's build_features) --
+    # same field live_ledger.py stores, added here 2026-08-04 so paper and
+    # live trades are directly comparable later, not just paper's own P&L.
+    features_json: str | None = None
 
     @property
     def cost_basis(self) -> float:
@@ -112,6 +125,8 @@ class ClosedTrade:
     closed_at: str
     strategy_name: str
     close_reason: str
+    entry_kind: str | None = None
+    features_json: str | None = None
 
 
 class PaperPortfolio:
@@ -124,8 +139,21 @@ class PaperPortfolio:
         # without blocking on (or being blocked by) the engine's writes.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
         self._init_account(starting_balance)
+
+    def _migrate_schema(self) -> None:
+        # Added 2026-08-04 for ledger parity with live_ledger.py -- ALTER
+        # TABLE ADD COLUMN rather than dropping/recreating, same reasoning
+        # as live_ledger.py's own migration (never disturb existing rows or
+        # an already-open connection from the running paper bot).
+        for table in ("positions", "closed_trades"):
+            cols = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "entry_kind" not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN entry_kind TEXT")
+            if "features_json" not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN features_json TEXT")
 
     def _init_account(self, starting_balance: float) -> None:
         row = self._conn.execute("SELECT * FROM account WHERE id = 1").fetchone()
@@ -172,6 +200,8 @@ class PaperPortfolio:
         entry_price_pct: float,
         entry_fee: float,
         strategy_name: str,
+        features_json: str | None = None,
+        entry_kind: str | None = None,
     ) -> Position:
         if self.get_open_position(ticker) is not None:
             raise ValueError(f"already have an open position in {ticker}")
@@ -181,13 +211,16 @@ class PaperPortfolio:
 
         opened_at = _now()
         cur = self._conn.execute(
-            "INSERT INTO positions (ticker, side, quantity, entry_price_pct, entry_fee, opened_at, strategy_name) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ticker, side, quantity, entry_price_pct, entry_fee, opened_at, strategy_name),
+            "INSERT INTO positions (ticker, side, quantity, entry_price_pct, entry_fee, opened_at, strategy_name, "
+            "features_json, entry_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ticker, side, quantity, entry_price_pct, entry_fee, opened_at, strategy_name, features_json, entry_kind),
         )
         self._adjust_cash(-cost)
         self._conn.commit()
-        return Position(cur.lastrowid, ticker, side, quantity, entry_price_pct, entry_fee, opened_at, strategy_name)
+        return Position(
+            cur.lastrowid, ticker, side, quantity, entry_price_pct, entry_fee, opened_at, strategy_name,
+            entry_kind=entry_kind, features_json=features_json,
+        )
 
     def close_position(self, ticker: str, exit_price_pct: float, exit_fee: float, close_reason: str) -> ClosedTrade:
         position = self.get_open_position(ticker)
@@ -200,8 +233,8 @@ class PaperPortfolio:
 
         cur = self._conn.execute(
             "INSERT INTO closed_trades (ticker, side, quantity, entry_price_pct, exit_price_pct, entry_fee, "
-            "exit_fee, realized_pnl, opened_at, closed_at, strategy_name, close_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "exit_fee, realized_pnl, opened_at, closed_at, strategy_name, close_reason, features_json, entry_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 position.ticker,
                 position.side,
@@ -215,6 +248,8 @@ class PaperPortfolio:
                 closed_at,
                 position.strategy_name,
                 close_reason,
+                position.features_json,
+                position.entry_kind,
             ),
         )
         self._conn.execute("DELETE FROM positions WHERE id = ?", (position.id,))
@@ -235,12 +270,16 @@ class PaperPortfolio:
             closed_at,
             position.strategy_name,
             close_reason,
+            entry_kind=position.entry_kind,
+            features_json=position.features_json,
         )
 
     # -- closed trades / history --------------------------------------------------------
 
-    def get_closed_trades(self) -> list[ClosedTrade]:
-        rows = self._conn.execute("SELECT * FROM closed_trades ORDER BY closed_at").fetchall()
+    def get_closed_trades(self, limit: int = 500, offset: int = 0) -> list[ClosedTrade]:
+        rows = self._conn.execute(
+            "SELECT * FROM closed_trades ORDER BY closed_at DESC LIMIT ? OFFSET ?", (limit, offset)
+        ).fetchall()
         return [ClosedTrade(**dict(r)) for r in rows]
 
     def get_realized_pnl_since(self, since_iso: str) -> float:
@@ -248,6 +287,10 @@ class PaperPortfolio:
             "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM closed_trades WHERE closed_at >= ?", (since_iso,)
         ).fetchone()
         return row["total"]
+
+    def get_total_realized_pnl(self) -> float:
+        row = self._conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM closed_trades").fetchone()
+        return float(row["total"])
 
     # -- equity curve --------------------------------------------------------
 

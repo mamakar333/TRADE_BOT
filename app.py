@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Must be set before pandas/pyarrow import. On this stack (pyarrow's Arrow C++
@@ -22,14 +22,16 @@ import pandas as pd
 import streamlit as st
 
 import run_live_trading
-from trade_bot import bot_control
+from trade_bot import bot_control, paper_bot_control
 from trade_bot.adaptive import PerformanceGovernor
 from trade_bot.categories import MARKET_CATEGORIES, is_combo_market, list_all_curated_markets, list_markets_for_category
 from trade_bot.client import KalshiAPIError, KalshiClient
 from trade_bot.data import (
+    CashFlowSummary,
     MarketSummary,
     filter_by_keyword,
     get_available_balance_dollars,
+    get_cash_flow_summary,
     get_market,
     get_market_orderbook,
     get_real_positions,
@@ -93,6 +95,14 @@ def _cached_bot_watchlist(_client: KalshiClient) -> list[str]:
     # dashboard (market badges, bot status table, manual-trade picker), so it's
     # cached once here rather than paying that cost three times per render.
     return build_watchlist(_client)
+
+
+CASH_FLOW_CACHE_TTL = 300  # seconds -- deposit/withdrawal history barely changes
+
+
+@st.cache_data(ttl=CASH_FLOW_CACHE_TTL, show_spinner=False)
+def _cached_cash_flow(_client: KalshiClient) -> CashFlowSummary:
+    return get_cash_flow_summary(_client)
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +509,43 @@ def markets_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _paper_bot_control_panel() -> None:
+    """Manual start/stop for the paper bot -- added 2026-08-04 per explicit
+    request ("a start button for paper bot for somereason if it stops").
+    No confirmation step needed (unlike the live bot's): nothing here can
+    ever place a real order, see trade_bot/engine.py's SIMULATION_MODE
+    guard. Deliberately no auto-restart-on-crash either, matching what was
+    actually asked for -- manual control, not a second watchdog."""
+    running, pid = paper_bot_control.is_running()
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        if running:
+            started = paper_bot_control.started_at()
+            uptime = ""
+            if started:
+                secs = time.time() - started
+                uptime = f" · up {secs / 60:.0f}min" if secs < 3600 else f" · up {secs / 3600:.1f}h"
+            st.success(f"🟢 Paper bot process RUNNING (PID {pid}){uptime}")
+        else:
+            st.error("🔴 Paper bot process STOPPED")
+    with c2:
+        if st.button("▶️ Start", width="stretch", disabled=running, key="paper_start_button"):
+            ok, msg = paper_bot_control.start()
+            (st.success if ok else st.error)(msg)
+            time.sleep(0.5)
+            st.rerun()
+    with c3:
+        if st.button("🛑 Stop", width="stretch", disabled=not running, key="paper_stop_button"):
+            ok, msg = paper_bot_control.stop()
+            (st.success if ok else st.warning)(msg)
+            time.sleep(0.5)
+            st.rerun()
+
+
 def bot_status_section(client: KalshiClient, portfolio: PaperPortfolio) -> None:
     st.subheader("Bot Status")
+
+    _paper_bot_control_panel()
 
     last_seen = _bot_last_seen()
     if last_seen is None:
@@ -807,32 +852,66 @@ def _live_summary_section(client: KalshiClient, ledger: LiveLedger) -> None:
     total_realized = ledger.get_total_realized_pnl()
     today_start = datetime.now(timezone.utc).date().isoformat() + "T00:00:00+00:00"
     today_pnl = ledger.get_realized_pnl_since(today_start)
-    open_trades = ledger.get_all_open_trades()
+    now = datetime.now(timezone.utc)
+    pnl_24h = ledger.get_realized_pnl_since((now - timedelta(hours=24)).isoformat())
+    pnl_7d = ledger.get_realized_pnl_since((now - timedelta(days=7)).isoformat())
+    # Exchange, not the local ledger, is the source of truth for "how many
+    # positions are open" -- a ledger row can go stale if its ticker rotated
+    # off the watchlist before being reconciled (fixed at the root in
+    # live_engine.py's run_once(), but this stays exchange-truth regardless
+    # so the count is never wrong even for the one cycle before that runs).
+    try:
+        open_position_count = len(get_real_positions(client, ticker_prefixes=run_live_trading.ACTIVE_CRYPTO_SERIES_PREFIXES))
+    except KalshiAPIError:
+        open_position_count = len(ledger.get_all_open_trades())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Real Balance", f"${balance:,.2f}" if balance is not None else "n/a")
-    c2.metric("Total Realized P&L", f"${total_realized:+,.2f}")
-    c3.metric("Today's P&L", f"${today_pnl:+,.2f}")
-    c4.metric("Open Positions", f"{len(open_trades)}")
+    c2.metric("Today's P&L", f"${today_pnl:+,.2f}")
+    c3.metric("Open Positions", f"{open_position_count}")
+    c4.metric("Historical (all-time) P&L", f"${total_realized:+,.2f}")
+
+    c5, c6 = st.columns(2)
+    c5.metric("Last 24h P&L", f"${pnl_24h:+,.2f}")
+    c6.metric("Last 7d P&L", f"${pnl_7d:+,.2f}")
+
+    try:
+        cash_flow = _cached_cash_flow(client)
+        c7, c8, c9 = st.columns(3)
+        c7.metric("Total Deposited (net)", f"${cash_flow.total_deposited_net_dollars:,.2f}")
+        c8.metric("Deposit Fees Paid", f"${cash_flow.total_deposit_fees_dollars:,.2f}")
+        c9.metric("Total Withdrawn", f"${cash_flow.total_withdrawn_dollars:,.2f}")
+        st.caption(
+            f"{cash_flow.deposit_count} deposits totaling ${cash_flow.total_deposited_gross_dollars:,.2f} gross "
+            f"(${cash_flow.total_deposit_fees_dollars:,.2f} in fees) · trading P&L is separate from this, "
+            "shown above"
+        )
+    except KalshiAPIError as e:
+        st.caption(f"Couldn't fetch deposit history: {e}")
 
     limit = run_live_trading.RISK_LIMITS.daily_stop_loss_dollars
+    enabled = run_live_trading.RISK_LIMITS.daily_kill_switch_enabled
     used_fraction = min(1.0, -today_pnl / limit) if today_pnl < 0 else 0.0
     st.progress(
         used_fraction,
         text=(
-            f"${-today_pnl:.2f} of ${limit:.0f} daily loss limit used"
+            f"${-today_pnl:.2f} of ${limit:.0f} daily loss reference used"
             if today_pnl < 0
-            else f"${today_pnl:+.2f} today — kill-switch not engaged"
-        ),
+            else f"${today_pnl:+.2f} today"
+        )
+        + ("" if enabled else " (kill-switch disabled — informational only, manual control via Stop)"),
     )
     if today_pnl <= -limit:
-        st.error("🛑 Daily loss kill-switch ENGAGED — no new entries until UTC midnight (open positions can still close).")
+        if enabled:
+            st.error("🛑 Daily loss kill-switch ENGAGED — no new entries until UTC midnight (open positions can still close).")
+        else:
+            st.warning(f"⚠️ Today's loss has passed the ${limit:.0f} reference figure — kill-switch is disabled, still trading. Stop manually if you want to pause.")
 
     governor = PerformanceGovernor(
         lambda name, limit: ledger.get_recent_realized_pnls_within_hours(name, limit, run_live_trading.GOVERNOR_LOOKBACK_HOURS),
         run_live_trading.GOVERNOR_CONFIG,
     )
-    gd = governor.evaluate("crypto_technical")
+    gd = governor.evaluate(run_live_trading.STRATEGY_NAME)
     if gd.multiplier <= 0:
         st.warning(f"🐢 **Adaptive governor: PAUSED** — {gd.reason}")
     elif gd.multiplier < 1.0:

@@ -2,10 +2,15 @@ package com.example.androidkalshibot.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val Purple80 = Color(0xFFD0BCFF)
-val PurpleGrey80 = Color(0xFFCCC2DC)
-val Pink80 = Color(0xFFEFB8C8)
+// A deliberate fintech palette -- deep indigo (trust, focus) + a warm amber
+// tertiary accent, rather than the generic Material starter purple. Kept
+// intentionally separate from the semantic P&L green/red used throughout
+// the dashboard (ui/Common.kt) so trading-outcome colors never
+// compete with the app's own brand colors for attention.
+val Indigo80 = Color(0xFFC2C9FF)
+val IndigoGrey80 = Color(0xFFC6C4DD)
+val Amber80 = Color(0xFFFFDDB3)
 
-val Purple40 = Color(0xFF6650a4)
-val PurpleGrey40 = Color(0xFF625b71)
-val Pink40 = Color(0xFF7D5260)
+val Indigo40 = Color(0xFF3949AB)
+val IndigoGrey40 = Color(0xFF5B5D72)
+val Amber40 = Color(0xFFB3690E)
