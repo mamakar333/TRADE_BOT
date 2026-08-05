@@ -60,6 +60,7 @@ from trade_bot.adaptive import AdaptiveConfig, PerformanceGovernor
 from trade_bot.bot_control import CONFIRMATION_PHRASE, remove_pidfile, write_pidfile
 from trade_bot.client import KalshiClient
 from trade_bot.data_driven_strategy import DataDrivenCryptoStrategy
+from trade_bot.interval_tracker import IntervalTracker
 from trade_bot.live_engine import LiveExecutionEngine, LiveRiskLimits
 from trade_bot.live_ledger import LiveLedger
 from trade_bot.online_learner import OnlineLogisticLearner
@@ -122,14 +123,16 @@ STRATEGY_PARAMS = dict(
     min_entry_price_pct=45.0,
     max_entry_price_pct=85.0,
     min_minutes_to_close=6.0,
-    # Tightened from the old strategy's 0.15 base / up-to-0.25 widened.
-    # Single largest lever the data analysis found: stop-losses fired at a
-    # -28.0% average realized return, far wider than winners were ever
-    # allowed to run (trailing-stop averaged ~+5-20%) -- losers were simply
-    # given much more room than winners, a losing combination at a sub-40%
-    # win rate no matter how good the entry signal is.
-    stop_loss_pct=0.10,
-    stop_loss_time_bonus_pct=0.05,
+    # REVISED 2026-08-05 -- see trade_bot/data_driven_strategy.py's field
+    # comments for the full writeup. Short version: the initial 0.10/0.05
+    # tightening (2026-08-04) overcorrected. Real results over the first
+    # ~23 hours on this strategy (201 trades) showed 63% of the 87
+    # stop-loss exits (standard + scalp) would have WON if held to actual
+    # settlement instead of being cut, and in aggregate the stop-loss
+    # mechanism cost -$37 relative to just holding on that data. Widened
+    # back up in response.
+    stop_loss_pct=0.20,
+    stop_loss_time_bonus_pct=0.10,
     stop_loss_time_reference_minutes=60.0,
     trail_activate_pct=0.05,
     trail_giveback_pct=0.03,
@@ -147,7 +150,12 @@ STRATEGY_PARAMS = dict(
     scalp_threshold_pct=1.5,
     scalp_dollars=5.0,
     scalp_take_profit_pct=0.08,
-    scalp_stop_loss_pct=0.08,
+    # REVISED 2026-08-05: was 0.08, firing on 74% of scalp trades at 5.7%
+    # win rate, 68.6% of which would have won if held -- same finding as
+    # the standard stop_loss_pct above, worse. scalp_max_hold_minutes
+    # already forces an exit regardless of price, so this doesn't undercut
+    # "fast in/out", it just stops the stop from deciding most outcomes.
+    scalp_stop_loss_pct=0.20,
     scalp_max_hold_minutes=2.5,
     momentum_hold_enabled=True,
     momentum_hold_confirm_minutes=1.0,
@@ -264,6 +272,7 @@ def main() -> None:
     write_pidfile()
 
     ledger = LiveLedger()
+    interval_tracker = IntervalTracker()
     strategy = DataDrivenCryptoStrategy(**STRATEGY_PARAMS)
     governor = PerformanceGovernor(
         lambda name, limit: ledger.get_recent_realized_pnls_within_hours(name, limit, GOVERNOR_LOOKBACK_HOURS),
@@ -288,6 +297,7 @@ def main() -> None:
         min_trades_for_ml_gate=MIN_TRADES_FOR_ML_GATE,
         ml_gate_threshold=ML_GATE_THRESHOLD,
         notify_topic=notify_topic,
+        interval_tracker=interval_tracker,
     )
 
     print("=" * 70)

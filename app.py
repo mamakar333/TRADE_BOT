@@ -39,10 +39,11 @@ from trade_bot.data import (
 )
 from trade_bot.engine import DEFAULT_LOG_PATH
 from trade_bot.fees import taker_fee_dollars
-from trade_bot.live_engine import DEFAULT_LOG_PATH as LIVE_LOG_PATH
+from trade_bot.live_engine import DEFAULT_LOG_PATH as LIVE_LOG_PATH, SMALL_BETS_ONLY_CAP_DOLLARS
 from trade_bot.live_ledger import LiveLedger, LiveTrade
 from trade_bot.online_learner import OnlineLogisticLearner
 from trade_bot.portfolio import PaperPortfolio, Position
+from trade_bot.push import push_status
 from trade_bot.strategy import MANUAL_STRATEGY_NAME
 from trade_bot.watchlist import build_watchlist
 
@@ -800,9 +801,33 @@ def _live_trades_df(trades: list[LiveTrade]) -> pd.DataFrame:
     )
 
 
-def _live_kill_switch_panel() -> None:
+def _live_kill_switch_panel(ledger: LiveLedger) -> None:
     st.subheader("⚡ Bot Control")
     running, pid = bot_control.is_running()
+
+    small_bets_only = ledger.get_small_bets_only()
+    new_small_bets_only = st.toggle(
+        f"🔒 Small bets only (≤ ${SMALL_BETS_ONLY_CAP_DOLLARS:.0f}/trade)",
+        value=small_bets_only,
+        key="live_small_bets_only",
+        help=(
+            "ON: every new entry is capped near this dollar amount, regardless of what the "
+            "strategy would normally size it at. OFF: normal sizing (up to the per-trade risk "
+            "cap shown below). Takes effect on the bot's next cycle -- no restart needed. Only "
+            "affects the live (real-money) bot."
+        ),
+    )
+    if new_small_bets_only != small_bets_only:
+        ledger.set_small_bets_only(new_small_bets_only)
+        st.rerun()
+
+    push = push_status()
+    if push["firebase_configured"] and push["device_registered"]:
+        st.caption("🔔 Native push: configured and a device is registered.")
+    elif push["firebase_configured"]:
+        st.caption("🔕 Native push: Firebase is configured, but no device has registered yet -- open the Android app once.")
+    else:
+        st.caption("🔕 Native push: not configured on the server yet -- see docs/FCM_SETUP.md step 3. ntfy fallback is unaffected.")
 
     c1, c2, c3 = st.columns([2, 1, 2])
     with c1:
@@ -1117,7 +1142,7 @@ def live_trading_tab() -> None:
     client = get_client()
     ledger = get_live_ledger()
 
-    _live_kill_switch_panel()
+    _live_kill_switch_panel(ledger)
     series_list = ", ".join(p.rstrip("-") for p in run_live_trading.ACTIVE_CRYPTO_SERIES_PREFIXES)
     st.caption(f"Scope: {series_list} · refreshes every {LIVE_REFRESH_SECONDS}s")
 

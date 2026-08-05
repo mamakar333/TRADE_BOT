@@ -60,6 +60,18 @@ CREATE TABLE IF NOT EXISTS learner_state (
     state_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Single-row table: live, user-controlled risk toggles that must be visible
+-- across processes (dashboard.service and api.service both WRITE this, the
+-- live trading process READS it every cycle) without a restart or redeploy
+-- -- same "shared sqlite file is the cross-process source of truth" pattern
+-- as learner_state above. Added 2026-08-05 for the "small bets only" cap
+-- (see LiveExecutionEngine._act's SMALL_BETS_ONLY_CAP_DOLLARS).
+CREATE TABLE IF NOT EXISTS risk_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    small_bets_only INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
+);
 """
 
 
@@ -153,6 +165,17 @@ class LiveLedger:
     def get_all_open_trades(self) -> list[LiveTrade]:
         rows = self._conn.execute("SELECT * FROM live_trades WHERE status = 'open'").fetchall()
         return [LiveTrade(**dict(r)) for r in rows]
+
+    def get_last_trade_for_ticker(self, ticker: str) -> LiveTrade | None:
+        """Most recent trade for a ticker regardless of open/closed status --
+        unlike get_open_trade, which returns None the moment a position
+        closes. Added 2026-08-05 for interval_tracker.py, which needs to
+        know "did the bot ever trade this interval, and how did it turn
+        out" even long after the position that traded it has closed."""
+        row = self._conn.execute(
+            "SELECT * FROM live_trades WHERE ticker = ? ORDER BY id DESC LIMIT 1", (ticker,)
+        ).fetchone()
+        return LiveTrade(**dict(row)) if row else None
 
     def record_close(
         self,
@@ -251,3 +274,20 @@ class LiveLedger:
     def load_learner_state(self) -> str | None:
         row = self._conn.execute("SELECT state_json FROM learner_state WHERE id = 1").fetchone()
         return row["state_json"] if row else None
+
+    def get_small_bets_only(self) -> bool:
+        """Live, cross-process toggle checked every cycle by
+        LiveExecutionEngine._act -- False (normal sizing) until a human
+        turns it on from the dashboard or app. See risk_settings' schema
+        comment above."""
+        row = self._conn.execute("SELECT small_bets_only FROM risk_settings WHERE id = 1").fetchone()
+        return bool(row["small_bets_only"]) if row else False
+
+    def set_small_bets_only(self, enabled: bool) -> None:
+        self._conn.execute(
+            "INSERT INTO risk_settings (id, small_bets_only, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET small_bets_only = excluded.small_bets_only, updated_at = excluded.updated_at",
+            (1 if enabled else 0, _now()),
+        )
+        self._conn.commit()
+        self.log_event("risk_settings_changed", f"small_bets_only={'on' if enabled else 'off'}")

@@ -55,6 +55,13 @@ class MarketSnapshot:
     # roughly the entire strategy's net loss, vs ~-$0.40 for normally-exited
     # trades.
     close_time: datetime | None = None
+    # Kalshi's own settlement result ("yes"/"no"), only ever populated once
+    # status is terminal ("finalized") -- None the entire rest of a
+    # market's life. Added 2026-08-05 for interval_tracker.py's ground-truth
+    # outcome tracking; harmless/unused by every strategy's own decision
+    # logic (a strategy has no legitimate use for a market's own outcome --
+    # by definition it's only known once nothing can be done about it).
+    result: str | None = None
 
     @property
     def mid_pct(self) -> float | None:
@@ -85,6 +92,13 @@ class StrategyDecision:
     # entry path -- unset by every strategy that doesn't have multiple entry
     # types.
     entry_kind: str | None = None
+    # The strategy's own p(win) estimate for this decision, when it computes
+    # one (currently only DataDrivenCryptoStrategy's logistic-regression
+    # gate). Populated on both HOLD (gated out) and BUY paths so
+    # interval_tracker.py can record "what did the bot think" even on
+    # cycles that didn't produce a trade. None for strategies that don't
+    # compute an explicit probability.
+    predicted_probability: float | None = None
 
 
 def force_settle_exit(snapshot: MarketSnapshot, position: Position) -> StrategyDecision:

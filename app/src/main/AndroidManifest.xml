@@ -3,6 +3,16 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets the app check connectivity before making a request instead of
+         only finding out via a failed HttpURLConnection call. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Required on Android 13+ (API 33) before ANY notification,
+         including one delivered via Firebase Cloud Messaging, can
+         actually be shown. Declaring it here is necessary but not
+         sufficient: MainActivity also requests it at runtime (see
+         AppRoot's notificationPermissionLauncher), which is the part that
+         actually prompts the user. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
@@ -25,6 +35,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Receives FCM pushes (trade_bot/push.py on the server side) even
+             when the app is backgrounded or killed; see that service's
+             own docstring for the notification-display logic. -->
+        <service
+            android:name=".push.KalshiFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

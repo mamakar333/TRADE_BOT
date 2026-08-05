@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "523795669608",
+    "project_id": "trade-bot-eda84",
+    "storage_bucket": "trade-bot-eda84.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:523795669608:android:41c1ab640ba66a272351dd",
+        "android_client_info": {
+          "package_name": "com.example.androidkalshibot"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCWR6-iqMWPBOcfGKlZGaM1Ho3nSJ0xzDc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

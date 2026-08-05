@@ -53,10 +53,12 @@ from .adaptive import PerformanceGovernor
 from .client import KalshiAPIError, KalshiClient
 from .data import get_available_balance_dollars, get_market, get_market_orderbook, get_real_positions
 from .fees import taker_fee_dollars
+from .interval_tracker import IntervalTracker, tracked_asset
 from .live_ledger import LiveLedger
 from .notifications import send_notification
 from .online_learner import OnlineLogisticLearner
 from .portfolio import Position
+from .push import send_push
 from .strategy import MarketSnapshot, Signal, Strategy
 
 # Circuit breaker: no LiveRiskLimits passed to this engine may exceed these,
@@ -64,6 +66,13 @@ from .strategy import MarketSnapshot, Signal, Strategy
 # editing this file -- a deliberate, reviewable act.
 ABSOLUTE_MAX_CAPITAL_DOLLARS = 500.0
 ABSOLUTE_MAX_POSITION_DOLLARS = 100.0
+
+# User-controlled soft cap, independent of the two hard limits above --
+# toggled live from the dashboard/app (LiveLedger.set_small_bets_only) with
+# no restart or redeploy needed, since _act() re-reads it fresh on every
+# entry. Added 2026-08-05 per explicit user request: a quick way to force
+# every new entry down to a small, low-risk size without touching config.
+SMALL_BETS_ONLY_CAP_DOLLARS = 5.0
 
 DEFAULT_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "live_decisions.log"
 
@@ -135,6 +144,7 @@ class LiveExecutionEngine:
         min_trades_for_ml_gate: int = 20,
         ml_gate_threshold: float = 0.40,
         notify_topic: str | None = None,
+        interval_tracker: IntervalTracker | None = None,
     ):
         if risk_limits.max_capital_dollars > ABSOLUTE_MAX_CAPITAL_DOLLARS:
             raise RuntimeError(
@@ -160,6 +170,10 @@ class LiveExecutionEngine:
         self.governor = governor
         self.fok_slippage_cents = fok_slippage_cents
         self.notify_topic = notify_topic
+        # None by default (same optionality convention as governor/learner
+        # above) -- run_live_trading.py wires up a real one; tests that
+        # don't care about interval tracking pay no extra DB cost.
+        self.interval_tracker = interval_tracker
         self._history: dict[str, list[MarketSnapshot]] = {}
         self._logger = self._make_logger(Path(log_path))
 
@@ -204,6 +218,7 @@ class LiveExecutionEngine:
             status=m.get("status", ""),
             orderbook_imbalance=self._fetch_orderbook_imbalance(ticker),
             close_time=self._parse_close_time(m.get("close_time")),
+            result=m.get("result") or None,
         )
 
     def _fetch_orderbook_imbalance(self, ticker: str) -> float | None:
@@ -385,9 +400,20 @@ class LiveExecutionEngine:
 
             self._act(ticker, snapshot, decision, real_pos, ledger_open, open_underlyings)
 
+            if self.interval_tracker is not None and tracked_asset(ticker) is not None:
+                last_trade = self.ledger.get_last_trade_for_ticker(ticker)
+                self.interval_tracker.record(
+                    snapshot, decision,
+                    trade_side=last_trade.side if last_trade else None,
+                    trade_realized_pnl=last_trade.realized_pnl if last_trade else None,
+                )
+
             history.append(snapshot)
             if len(history) > self.history_window:
                 del history[: len(history) - self.history_window]
+
+        if self.interval_tracker is not None:
+            self.interval_tracker.reconcile_pending(self.client)
 
     def _act(self, ticker, snapshot: MarketSnapshot, decision, real_pos, ledger_open, open_underlyings: set[str]) -> None:
         if decision.signal == Signal.HOLD:
@@ -462,12 +488,18 @@ class LiveExecutionEngine:
             target_cost = decision.size * own_side_ask / 100 * governor_multiplier * ml_multiplier
             target_cost = min(target_cost, dynamic_cap, self.risk_limits.max_capital_dollars, available)
 
+            small_bets_only = self.ledger.get_small_bets_only()
+            small_bets_note = ""
+            if small_bets_only and target_cost > SMALL_BETS_ONLY_CAP_DOLLARS:
+                target_cost = SMALL_BETS_ONLY_CAP_DOLLARS
+                small_bets_note = f", small-bets-only cap ${SMALL_BETS_ONLY_CAP_DOLLARS:.0f}"
+
             count = int(target_cost // (own_side_ask / 100))
             if count < 1:
                 self._log(
                     event="skip", ticker=ticker,
                     reason=f"governed/capped target ${target_cost:.2f} (balance ${available:.2f}, "
-                    f"cap ${dynamic_cap:.2f}) too small for 1 contract at {own_side_ask:.1f}c",
+                    f"cap ${dynamic_cap:.2f}{small_bets_note}) too small for 1 contract at {own_side_ask:.1f}c",
                 )
                 return
 
@@ -507,10 +539,12 @@ class LiveExecutionEngine:
                 price=fill_price_pct, fee=total_fee, order_id=resp.get("order_id"),
                 governor=governor_reason, ml=ml_note, reason=decision.reason,
             )
-            send_notification(
-                self.notify_topic, f"Opened {side} on {ticker}",
-                f"{fill_count} contracts @ {fill_price_pct:.1f}c\n{decision.reason}",
+            dollars_risked = fill_count * fill_price_pct / 100 + total_fee
+            open_body = (
+                f"{fill_count} contracts @ {fill_price_pct:.1f}c (${dollars_risked:.2f} incl. fees)\n{decision.reason}"
             )
+            send_notification(self.notify_topic, f"Opened {side} on {ticker}", open_body)
+            send_push(f"Opened {side} on {ticker}", open_body)
 
         elif decision.signal == Signal.SELL:
             if real_pos is None:
@@ -578,12 +612,14 @@ class LiveExecutionEngine:
             )
             pnl_note = f"${realized_pnl:+.2f}" if realized_pnl is not None else "unknown pnl"
             won = (realized_pnl or 0) >= 0
+            close_title = f"{'WIN' if won else 'LOSS'}: Closed {real_pos.side} on {ticker} ({pnl_note})"
+            entry_note = f"entry {ledger_open.entry_price_pct:.1f}c -> " if ledger_open is not None else ""
+            close_body = f"{'✅' if won else '❌'} {entry_note}exit {exit_price_pct:.1f}c\n{decision.reason}"
             send_notification(
-                self.notify_topic,
-                f"{'WIN' if won else 'LOSS'}: Closed {real_pos.side} on {ticker} ({pnl_note})",
-                f"{'✅' if won else '❌'} {decision.reason}",
+                self.notify_topic, close_title, close_body,
                 priority="default" if won else "high",
             )
+            send_push(close_title, close_body)
 
     def run_forever(self, interval_seconds: float = 20.0) -> None:
         while True:
