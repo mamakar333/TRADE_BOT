@@ -363,15 +363,31 @@ class LiveExecutionEngine:
                     event="reconciled_missing_position", ticker=ticker,
                     note="ledger showed an open position the exchange doesn't -- closing ledger row, exchange wins",
                 )
-                fallback_mark = snapshot.yes_bid_pct if ledger_open.side == "YES" else snapshot.no_bid_pct
-                if fallback_mark is not None:
+                # Diagnosed live 2026-08-05: Kalshi zeroes out yes_bid/no_bid
+                # on ANY finalized market regardless of which side actually
+                # won, so falling back to a live quote here silently recorded
+                # a 0 mark for every reconciled close once a market settled
+                # -- correct by coincidence when our side lost, but a
+                # phantom near-total loss when it WON (verified against two
+                # real trades: $17.34 and $20.61 in fake losses on positions
+                # that had actually settled as wins). Prefer the market's own
+                # settlement result when it's available: a contract is worth
+                # exactly 100 if it matches the result, 0 otherwise -- never
+                # a live quote, which is meaningless once terminal.
+                close_reason = "reconciled: exchange no longer shows this position"
+                if snapshot.result:
+                    settlement_mark = 100.0 if snapshot.result.lower() == ledger_open.side.lower() else 0.0
+                    close_reason = f"reconciled: market settled {snapshot.result.upper()} (exchange no longer shows this position)"
+                else:
+                    settlement_mark = snapshot.yes_bid_pct if ledger_open.side == "YES" else snapshot.no_bid_pct
+                if settlement_mark is not None:
                     pnl_est = (
-                        ledger_open.quantity * (fallback_mark - ledger_open.entry_price_pct) / 100
+                        ledger_open.quantity * (settlement_mark - ledger_open.entry_price_pct) / 100
                         - ledger_open.entry_fee
                     )
                     self.ledger.record_close(
-                        ledger_open.id, fallback_mark, 0.0, pnl_est,
-                        "reconciled: exchange no longer shows this position", None, None,
+                        ledger_open.id, settlement_mark, 0.0, pnl_est,
+                        close_reason, None, None,
                     )
                 ledger_open = None
 

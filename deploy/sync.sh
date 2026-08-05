@@ -26,6 +26,10 @@ rsync -avz --delete \
     --exclude '*.db-shm' \
     --exclude 'logs/' \
     --exclude '.git' \
+    --exclude 'app/build/' \
+    --exclude 'build/' \
+    --exclude '.gradle/' \
+    --exclude '.kotlin/' \
     "$REPO_ROOT/" "$TARGET:/home/tradebot/TRADE_BOT/"
 
 echo "==> Code synced. Secrets and local state were deliberately NOT touched."
