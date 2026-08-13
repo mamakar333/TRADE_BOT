@@ -128,6 +128,12 @@ class ExecutionEngine:
             status=m.get("status", ""),
             orderbook_imbalance=self._fetch_orderbook_imbalance(ticker),
             close_time=self._parse_close_time(m.get("close_time")),
+            # Added 2026-08-13: was missing entirely, unlike live_engine.py's
+            # equivalent -- meant force_settle_exit's snapshot.result branch
+            # (see that function's docstring for the phantom-loss bug this
+            # fixes) was silently a no-op for every paper-traded market,
+            # including every MLB paper trade so far.
+            result=m.get("result") or None,
         )
 
     @staticmethod
@@ -298,16 +304,51 @@ class ExecutionEngine:
                 self._log(event="skip", ticker=ticker, reason=f"no {side} ask available to fill against")
                 return
 
-            risk = self._check_entry_risk(decision.size, fill_price)
+            # Diagnosed live 2026-08-06: a strategy's dollar TARGET is
+            # computed independent of the account's actual balance (by
+            # design here -- see run_paper_trading.py's docstring on why
+            # sizing is deliberately uncapped), so once the balance drops
+            # below whatever a strategy is currently targeting, EVERY
+            # future entry attempt failed outright on insufficient cash --
+            # the account could never place another trade, never bust, and
+            # therefore never reach PaperPortfolio.reset_if_busted's $1000
+            # reload. Confirmed live: stuck at $161 for 2+ hours, 874
+            # consecutive insufficient-cash failures, zero trades. Clamping
+            # down to whatever IS affordable (instead of an all-or-nothing
+            # skip) is what "no limit on trade max amount" actually has to
+            # mean for this to keep running no matter what, the way it was
+            # asked to.
+            size = decision.size
+            available_cash = self.portfolio.get_cash_balance()
+            target_cost = size * fill_price / 100 + taker_fee_dollars(size, fill_price)
+            if target_cost > available_cash:
+                unit_cost = fill_price / 100 + taker_fee_dollars(1, fill_price)
+                size = int(available_cash // unit_cost) if unit_cost > 0 else 0
+                while size > 0 and size * fill_price / 100 + taker_fee_dollars(size, fill_price) > available_cash:
+                    size -= 1
+                if size < 1:
+                    self._log(
+                        event="skip", ticker=ticker,
+                        reason=f"cash ${available_cash:.2f} can't afford even 1 contract at {fill_price:.1f}c "
+                        f"(target was {decision.size} contracts, ${target_cost:.2f})",
+                    )
+                    return
+                self._log(
+                    event="size_clamped", ticker=ticker,
+                    reason=f"target {decision.size} contracts (${target_cost:.2f}) exceeds cash ${available_cash:.2f} "
+                    f"-- clamped to {size}",
+                )
+
+            risk = self._check_entry_risk(size, fill_price)
             if not risk.allowed:
                 self._log(event="risk_blocked", ticker=ticker, reason=risk.reason)
                 return
 
-            fee = taker_fee_dollars(decision.size, fill_price)
+            fee = taker_fee_dollars(size, fill_price)
             features_json = json.dumps(decision.features) if decision.features is not None else None
             try:
                 self.portfolio.open_position(
-                    ticker, side, decision.size, fill_price, fee, strategy.name,
+                    ticker, side, size, fill_price, fee, strategy.name,
                     features_json=features_json, entry_kind=decision.entry_kind,
                 )
             except ValueError as e:
@@ -315,7 +356,7 @@ class ExecutionEngine:
                 return
             self._log(
                 event="fill", action="open", ticker=ticker, side=side,
-                quantity=decision.size, price=fill_price, fee=fee,
+                quantity=size, price=fill_price, fee=fee,
             )
 
         elif decision.signal == Signal.SELL:

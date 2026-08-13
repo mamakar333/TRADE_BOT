@@ -44,7 +44,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from typing import Callable
@@ -59,7 +59,7 @@ from .notifications import send_notification
 from .online_learner import OnlineLogisticLearner
 from .portfolio import Position
 from .push import send_push
-from .strategy import MarketSnapshot, Signal, Strategy
+from .strategy import MarketSnapshot, Signal, Strategy, StrategyDecision
 
 # Circuit breaker: no LiveRiskLimits passed to this engine may exceed these,
 # regardless of what run_live_trading.py configures. Raising these requires
@@ -145,6 +145,10 @@ class LiveExecutionEngine:
         ml_gate_threshold: float = 0.40,
         notify_topic: str | None = None,
         interval_tracker: IntervalTracker | None = None,
+        reentry_cooldown_minutes: float = 8.0,
+        extra_toggle_refresh: Callable[[], None] | None = None,
+        underlying_key_fn: Callable[[str], str] | None = None,
+        pause_new_entries_when: Callable[[], bool] | None = None,
     ):
         if risk_limits.max_capital_dollars > ABSOLUTE_MAX_CAPITAL_DOLLARS:
             raise RuntimeError(
@@ -174,8 +178,39 @@ class LiveExecutionEngine:
         # above) -- run_live_trading.py wires up a real one; tests that
         # don't care about interval tracking pay no extra DB cost.
         self.interval_tracker = interval_tracker
+        # Diagnosed live 2026-08-06: without this, the SAME ticker could hit
+        # a stop-loss, re-enter, and hit another stop-loss again within
+        # minutes -- observed directly, e.g. KXBTCD-26AUG0523-T64499.99 was
+        # stopped/trailed out FOUR separate times within 40 minutes during
+        # one choppy stretch, and a BTC/ETH scalp ticker was stopped out
+        # three times in three minutes during another. The generic paper
+        # ExecutionEngine (trade_bot/engine.py) already had exactly this
+        # protection; it was simply never ported to the live engine when
+        # this one was built. Same mechanism, same default duration.
+        self.reentry_cooldown_minutes = reentry_cooldown_minutes
+        self._cooldown_until: dict[str, datetime] = {}
         self._history: dict[str, list[MarketSnapshot]] = {}
         self._logger = self._make_logger(Path(log_path))
+        # Generalized 2026-08-12 for the MLB strategy's own live toggle
+        # (mlb_trading_enabled) -- was a hardcoded btc_dip_enabled refresh
+        # inline in run_once() below. None (the default) means "nothing
+        # extra to refresh"; run_live_trading.py passes its exact previous
+        # lambda so crypto's behavior is unchanged.
+        self.extra_toggle_refresh = extra_toggle_refresh
+        # Generalized 2026-08-12 for the same-game exposure guard MLB needs
+        # (mlb_watchlist.game_key groups both team-side tickers of one
+        # game) -- defaults to the existing crypto underlying_asset()
+        # function, so crypto's correlated-asset behavior is unchanged.
+        self.underlying_key_fn = underlying_key_fn or underlying_asset
+        # Added 2026-08-13 per explicit user request: crypto and MLB trade
+        # the same real Kalshi account/capital pool from two independent
+        # processes -- when MLB trading is turned on, new crypto entries
+        # should pause rather than compete with it for the same balance.
+        # None (the default) means never pause -- MLB's own engine instance
+        # doesn't pass this at all, it has no reason to pause itself. Only
+        # blocks NEW entries, same as the daily kill-switch/governor pause;
+        # existing open positions still get managed/exited normally.
+        self.pause_new_entries_when = pause_new_entries_when
 
     def _make_logger(self, log_path: Path) -> logging.Logger:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,6 +334,20 @@ class LiveExecutionEngine:
         return "bid", min(99.0, snapshot.yes_ask_pct + self.fok_slippage_cents)
 
     def run_once(self) -> None:
+        # Refreshes whatever strategy-specific live toggle this engine
+        # instance was configured with (e.g. crypto's btc_dip_enabled, or
+        # MLB's mlb_trading_enabled) from the shared ledger once per cycle,
+        # so flipping it in the dashboard/app takes effect on the next
+        # cycle with no restart. Best-effort: a plain attribute set can't
+        # realistically raise, but this must never be the thing that takes
+        # a cycle down regardless. See extra_toggle_refresh's constructor
+        # comment.
+        if self.extra_toggle_refresh is not None:
+            try:
+                self.extra_toggle_refresh()
+            except Exception:
+                self._log(event="extra_toggle_refresh_error", error="failed to refresh an extra live toggle")
+
         try:
             watchlist = self.watchlist_resolver()
         except KalshiAPIError as e:
@@ -332,8 +381,10 @@ class LiveExecutionEngine:
         # moment a fill actually happens, so a second correlated ticker
         # processed later in this SAME cycle also sees the asset as already
         # committed, not just on the next poll. See underlying_asset()'s
-        # docstring above for why this exists.
-        open_underlyings = {underlying_asset(p.ticker) for p in real_positions}
+        # docstring above for why this exists (and self.underlying_key_fn's
+        # constructor comment for how MLB reuses this same mechanism keyed
+        # by game instead of by crypto asset).
+        open_underlyings = {self.underlying_key_fn(p.ticker) for p in real_positions}
 
         for ticker in tickers_to_check:
             snapshot = self._fetch_snapshot(ticker)
@@ -405,7 +456,14 @@ class LiveExecutionEngine:
                     entry_kind=ledger_open.entry_kind if ledger_open else None,
                 )
 
-            decision = self.strategy.evaluate(snapshot, history, position)
+            cooldown_until = self._cooldown_until.get(ticker)
+            if position is None and cooldown_until is not None and snapshot.timestamp < cooldown_until:
+                remaining = (cooldown_until - snapshot.timestamp).total_seconds() / 60
+                decision = StrategyDecision(
+                    Signal.HOLD, reason=f"re-entry cooldown after stop-loss, {remaining:.1f}min remaining"
+                )
+            else:
+                decision = self.strategy.evaluate(snapshot, history, position)
 
             self._log(
                 event="decision", ticker=ticker, signal=decision.signal.value, size=decision.size,
@@ -440,7 +498,14 @@ class LiveExecutionEngine:
                 self._log(event="skip", ticker=ticker, reason="already have a real open position in this market")
                 return
 
-            asset = underlying_asset(ticker)
+            if self.pause_new_entries_when is not None and self.pause_new_entries_when():
+                self._log(
+                    event="skip", ticker=ticker,
+                    reason="new entries paused -- another live strategy sharing this account is currently trading",
+                )
+                return
+
+            asset = self.underlying_key_fn(ticker)
             if asset in open_underlyings:
                 self._log(
                     event="skip", ticker=ticker,
@@ -602,6 +667,14 @@ class LiveExecutionEngine:
             if fill_count <= 0:
                 self._log(event="order_not_filled", ticker=ticker, action="close", response=resp)
                 return
+
+            if "stop-loss" in decision.reason:
+                until = snapshot.timestamp + timedelta(minutes=self.reentry_cooldown_minutes)
+                self._cooldown_until[ticker] = until
+                self._log(
+                    event="cooldown_start", ticker=ticker,
+                    reason=f"stop-loss exit; blocking new entries on this ticker for {self.reentry_cooldown_minutes}min",
+                )
 
             avg_fill_price = resp.get("average_fill_price")
             yes_scale_fill = float(avg_fill_price) * 100 if avg_fill_price is not None else submit_price

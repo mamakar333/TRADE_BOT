@@ -1,0 +1,25 @@
+[Unit]
+Description=BTC/USD price collector - 1s polling from Coinbase's public spot endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/home/tradebot/TRADE_BOT
+ExecStart=/home/tradebot/TRADE_BOT/.venv/bin/python3 run_btc_price_collector.py
+Restart=always
+RestartSec=5
+KillMode=process
+StandardOutput=append:/home/tradebot/TRADE_BOT/logs/btc_price_collector_stdout.log
+StandardError=append:/home/tradebot/TRADE_BOT/logs/btc_price_collector_stdout.log
+
+# Hardening -- same as api.service/dashboard.service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/tradebot/TRADE_BOT
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

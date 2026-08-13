@@ -1,0 +1,16 @@
+[Unit]
+Description=Kalshi trade bot watchdog - restarts the bot if it dies unexpectedly, never across a reboot
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=tradebot
+Group=tradebot
+WorkingDirectory=/home/tradebot/TRADE_BOT
+ExecStart=/home/tradebot/TRADE_BOT/.venv/bin/python3 run_watchdog.py
+
+# Hardening -- same as dashboard.service/api.service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/tradebot/TRADE_BOT
+PrivateTmp=true

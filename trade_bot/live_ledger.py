@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS learner_state (
 -- live trading process READS it every cycle) without a restart or redeploy
 -- -- same "shared sqlite file is the cross-process source of truth" pattern
 -- as learner_state above. Added 2026-08-05 for the "small bets only" cap
--- (see LiveExecutionEngine._act's SMALL_BETS_ONLY_CAP_DOLLARS).
+-- (see LiveExecutionEngine._act's SMALL_BETS_ONLY_CAP_DOLLARS). Also holds
+-- btc_dip_enabled (added 2026-08-07, see DataDrivenCryptoStrategy's
+-- btc_dip_* fields) -- same shared-toggle need, so it lives in the same
+-- single-row table rather than a second one.
 CREATE TABLE IF NOT EXISTS risk_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     small_bets_only INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +131,21 @@ class LiveLedger:
         # and a non-numeric string value there would break it.
         if "entry_kind" not in cols:
             self._conn.execute("ALTER TABLE live_trades ADD COLUMN entry_kind TEXT")
+        # Added 2026-08-07: risk_settings already exists on the production
+        # DB from the small_bets_only rollout, so CREATE TABLE IF NOT
+        # EXISTS alone won't add this column -- same ALTER-in-place pattern
+        # as above.
+        risk_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(risk_settings)").fetchall()}
+        if "btc_dip_enabled" not in risk_cols:
+            self._conn.execute("ALTER TABLE risk_settings ADD COLUMN btc_dip_enabled INTEGER NOT NULL DEFAULT 0")
+        # Added 2026-08-12 for the MLB game-winner strategy (see
+        # trade_bot/mlb_strategy.py) -- same shared risk_settings table
+        # rather than a new one, same reasoning as btc_dip_enabled above.
+        # Trade history itself lives fully isolated in mlb_trading.db (see
+        # trade_bot/mlb_ledger.py); only this cross-process toggle lives
+        # here, reusing the one mechanism already wired end-to-end.
+        if "mlb_trading_enabled" not in risk_cols:
+            self._conn.execute("ALTER TABLE risk_settings ADD COLUMN mlb_trading_enabled INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         self._conn.close()
@@ -291,3 +309,40 @@ class LiveLedger:
         )
         self._conn.commit()
         self.log_event("risk_settings_changed", f"small_bets_only={'on' if enabled else 'off'}")
+
+    def get_btc_dip_enabled(self) -> bool:
+        """Live, cross-process toggle for the BTC15M dip-buy mechanism
+        (see DataDrivenCryptoStrategy._evaluate_btc_dip_entry) -- checked
+        fresh every cycle by LiveExecutionEngine.run_once(), same pattern
+        as get_small_bets_only above. False (off) until a human turns it
+        on from the dashboard or app."""
+        row = self._conn.execute("SELECT btc_dip_enabled FROM risk_settings WHERE id = 1").fetchone()
+        return bool(row["btc_dip_enabled"]) if row else False
+
+    def set_btc_dip_enabled(self, enabled: bool) -> None:
+        self._conn.execute(
+            "INSERT INTO risk_settings (id, btc_dip_enabled, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET btc_dip_enabled = excluded.btc_dip_enabled, updated_at = excluded.updated_at",
+            (1 if enabled else 0, _now()),
+        )
+        self._conn.commit()
+        self.log_event("risk_settings_changed", f"btc_dip_enabled={'on' if enabled else 'off'}")
+
+    def get_mlb_trading_enabled(self) -> bool:
+        """Live, cross-process toggle for the MLB game-winner strategy (see
+        trade_bot/mlb_strategy.py) -- checked fresh every cycle by the MLB
+        LiveExecutionEngine instance (run_mlb_trading.py), same pattern as
+        get_btc_dip_enabled above. False (off) until a human turns it on
+        from the dashboard or app."""
+        row = self._conn.execute("SELECT mlb_trading_enabled FROM risk_settings WHERE id = 1").fetchone()
+        return bool(row["mlb_trading_enabled"]) if row else False
+
+    def set_mlb_trading_enabled(self, enabled: bool) -> None:
+        self._conn.execute(
+            "INSERT INTO risk_settings (id, mlb_trading_enabled, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET mlb_trading_enabled = excluded.mlb_trading_enabled, "
+            "updated_at = excluded.updated_at",
+            (1 if enabled else 0, _now()),
+        )
+        self._conn.commit()
+        self.log_event("risk_settings_changed", f"mlb_trading_enabled={'on' if enabled else 'off'}")

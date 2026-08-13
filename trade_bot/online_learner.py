@@ -47,6 +47,15 @@ FEATURE_NAMES = [
     "hour_cos",
     "asset_btc",
     "asset_eth",
+    # Added 2026-08-11: realized volatility of the true underlying BTC/USD
+    # price (trade_bot/btc_price_history.py's continuous Coinbase feed, 1
+    # tick/sec) over the trailing 5 minutes, distinct from volatility_scaled
+    # above (which measures noise in the Kalshi CONTRACT's own mid-price,
+    # a bounded, low-resolution, once-per-poll proxy). 0.0 whenever the feed
+    # isn't wired in (paper/tests) or doesn't have 5 minutes of history yet
+    # -- same "absent = no signal" contract as every other optional feature
+    # here, so this is fully backward compatible with existing weights.
+    "btc_realized_vol_scaled",
 ]
 
 _BTC_PREFIXES = ("KXBTC15M-", "KXBTCD-")
@@ -65,6 +74,7 @@ def build_features(
     side: str,
     hour_utc: int | None = None,
     ticker: str = "",
+    btc_realized_vol: float | None = None,
 ) -> dict[str, float]:
     """Raw signal values the strategy already computed for its own decision,
     rescaled to roughly [-1, 1] with FIXED divisors (not online-normalized)
@@ -84,6 +94,14 @@ def build_features(
         "hour_cos": math.cos(hour_angle) if hour_utc is not None else 0.0,
         "asset_btc": 1.0 if ticker.startswith(_BTC_PREFIXES) else 0.0,
         "asset_eth": 1.0 if ticker.startswith(_ETH_PREFIXES) else 0.0,
+        # Divisor calibrated 2026-08-11 against the first ~24h of real
+        # collected ticks (1481 rolling 5-min samples): p50=0.0048,
+        # p90=0.0117, p99=0.0193, max=0.0229 -- 0.02 puts typical readings
+        # around 0.2-0.6 and the most extreme observed so far near 1.0,
+        # consistent with how the other _scaled features are calibrated.
+        # Revisit once more days of data (esp. a genuinely volatile one)
+        # are in.
+        "btc_realized_vol_scaled": (btc_realized_vol or 0.0) / 0.02,
     }
 
 
@@ -133,12 +151,22 @@ class OnlineLogisticLearner:
         )
 
     @classmethod
-    def from_json(cls, raw: str | None) -> "OnlineLogisticLearner":
+    def from_json(cls, raw: str | None, feature_names: list[str] | None = None) -> "OnlineLogisticLearner":
+        """`feature_names` seeds the default (zero) weights for any key not
+        already present in `raw` -- defaults to this module's own crypto
+        FEATURE_NAMES (unchanged behavior for every existing caller).
+        Added 2026-08-12 so trade_bot/mlb_ledger.py's learner can seed with
+        mlb_features.FEATURE_NAMES instead -- without this, every MLB
+        learner state would carry 12 dead crypto keys forever (harmless to
+        predict_proba/update, which only ever touch whatever's in the
+        `features` dict passed in at call time, but real cross-domain
+        pollution in the persisted state worth just not creating)."""
+        names = feature_names if feature_names is not None else FEATURE_NAMES
         if not raw:
-            return cls()
+            return cls(weights={k: 0.0 for k in names})
         data = json.loads(raw)
         return cls(
-            weights={**{k: 0.0 for k in FEATURE_NAMES}, **data.get("weights", {})},
+            weights={**{k: 0.0 for k in names}, **data.get("weights", {})},
             bias=data.get("bias", 0.0),
             n_updates=data.get("n_updates", 0),
             learning_rate=data.get("learning_rate", 0.05),

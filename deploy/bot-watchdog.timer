@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic liveness check for the Kalshi trade bot
+
+[Timer]
+# First check shortly after boot (to detect+clear a stale "running" intent
+# left over from before a reboot -- see bot_control.watchdog_check()'s
+# reboot-safety check), then every 3 minutes indefinitely.
+OnBootSec=2min
+OnUnitActiveSec=3min
+
+[Install]
+WantedBy=timers.target

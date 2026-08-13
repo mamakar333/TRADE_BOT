@@ -107,7 +107,33 @@ def force_settle_exit(snapshot: MarketSnapshot, position: Position) -> StrategyD
     `_TakeProfitStopLossStrategy._force_settle_exit`) and the engine's manual-
     position handling (trade_bot/engine.py), since a manual position must
     still be reconciled when its market actually resolves, even though the
-    bot otherwise never touches manual positions."""
+    bot otherwise never touches manual positions.
+
+    Prefers `snapshot.result` (Kalshi's own real settlement outcome,
+    "yes"/"no") over a live bid/last-price quote whenever it's available.
+    Found live 2026-08-13 via MlbGameWinnerStrategy (which relies on this
+    function for 100% of its exits, having no active stop-loss/trailing of
+    its own): Kalshi zeroes out BOTH yes_bid and no_bid on any finalized
+    market regardless of which side actually won, so the old bid-only logic
+    recorded every single settled MLB paper trade as a total loss -- 6 of 8
+    real closed trades checked against actual game outcomes had in fact
+    WON. This is the same root cause already fixed once for live crypto
+    (see live_engine.py's reconciliation code, which computes
+    settlement_mark from snapshot.result the same way) but that fix never
+    reached this shared function, which crypto's own proactive stop-loss/
+    trailing/urgency exits mostly avoid hitting in practice -- MLB's
+    hold-to-outcome design hits it on every single trade, which is what
+    surfaced it."""
+    if snapshot.result:
+        won = snapshot.result.lower() == position.side.lower()
+        mark = 100.0 if won else 0.0
+        return StrategyDecision(
+            Signal.SELL,
+            size=position.quantity,
+            reason=f"market status is {snapshot.status!r}; settled {snapshot.result.upper()} "
+            f"({'won' if won else 'lost'}) -- closing out at {mark:.1f}",
+        )
+
     mark = snapshot.yes_bid_pct if position.side == "YES" else snapshot.no_bid_pct
     if mark is None:
         mark = snapshot.last_price_pct

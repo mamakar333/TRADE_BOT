@@ -1,0 +1,25 @@
+[Unit]
+Description=MLB game-winner paper trading (simulation only, no real orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/home/tradebot/TRADE_BOT
+ExecStart=/home/tradebot/TRADE_BOT/.venv/bin/python3 run_mlb_paper_trading.py
+Restart=always
+RestartSec=30
+KillMode=process
+StandardOutput=append:/home/tradebot/TRADE_BOT/logs/mlb_paper_stdout.log
+StandardError=append:/home/tradebot/TRADE_BOT/logs/mlb_paper_stdout.log
+
+# Hardening -- same as every other service in this repo.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/tradebot/TRADE_BOT
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

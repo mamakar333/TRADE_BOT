@@ -22,7 +22,8 @@ import pandas as pd
 import streamlit as st
 
 import run_live_trading
-from trade_bot import bot_control, paper_bot_control
+import run_mlb_trading
+from trade_bot import bot_control, mlb_bot_control, paper_bot_control
 from trade_bot.adaptive import PerformanceGovernor
 from trade_bot.categories import MARKET_CATEGORIES, is_combo_market, list_all_curated_markets, list_markets_for_category
 from trade_bot.client import KalshiAPIError, KalshiClient
@@ -37,10 +38,12 @@ from trade_bot.data import (
     get_real_positions,
     list_open_markets,
 )
+from trade_bot.btc_price_history import BtcPriceHistory, WINDOWS as BTC_PRICE_WINDOWS
 from trade_bot.engine import DEFAULT_LOG_PATH
 from trade_bot.fees import taker_fee_dollars
 from trade_bot.live_engine import DEFAULT_LOG_PATH as LIVE_LOG_PATH, SMALL_BETS_ONLY_CAP_DOLLARS
 from trade_bot.live_ledger import LiveLedger, LiveTrade
+from trade_bot.mlb_ledger import MlbLedger, MlbTrade
 from trade_bot.online_learner import OnlineLogisticLearner
 from trade_bot.portfolio import PaperPortfolio, Position
 from trade_bot.push import push_status
@@ -65,6 +68,11 @@ def get_client() -> KalshiClient:
 @st.cache_resource
 def get_portfolio() -> PaperPortfolio:
     return PaperPortfolio()
+
+
+@st.cache_resource
+def get_btc_price_history() -> BtcPriceHistory:
+    return BtcPriceHistory()
 
 
 @st.cache_resource
@@ -821,6 +829,24 @@ def _live_kill_switch_panel(ledger: LiveLedger) -> None:
         ledger.set_small_bets_only(new_small_bets_only)
         st.rerun()
 
+    btc_dip_enabled = ledger.get_btc_dip_enabled()
+    new_btc_dip_enabled = st.toggle(
+        "🪙 BTC 15-min dip-buy (practice/test)",
+        value=btc_dip_enabled,
+        key="live_btc_dip_enabled",
+        help=(
+            "ON: in the first few minutes of each fresh KXBTC15M contract, buy whichever side "
+            "(YES/up or NO/down) has been beaten down to a cheap 20-30c band, on the pattern that "
+            "it often bounces back to 40c+ shortly after. Small fixed stake ($2-3), its own "
+            "stop-loss and profit-lock, independent of the main strategy's normal entry logic. "
+            "Takes effect on the bot's next cycle -- no restart needed. Only affects the live "
+            "(real-money) bot, KXBTC15M only."
+        ),
+    )
+    if new_btc_dip_enabled != btc_dip_enabled:
+        ledger.set_btc_dip_enabled(new_btc_dip_enabled)
+        st.rerun()
+
     push = push_status()
     if push["firebase_configured"] and push["device_registered"]:
         st.caption("🔔 Native push: configured and a device is registered.")
@@ -865,6 +891,105 @@ def _live_kill_switch_panel(ledger: LiveLedger) -> None:
                 (st.success if ok else st.error)(msg)
                 time.sleep(0.5)
                 st.rerun()
+
+
+def _mlb_trades_df(trades: list[MlbTrade]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Ticker": t.ticker,
+                "Side": t.side,
+                "Qty": t.quantity,
+                "Entry %": t.entry_price_pct,
+                "Exit %": t.exit_price_pct,
+                "Fees": (t.entry_fee or 0) + (t.exit_fee or 0),
+                "Realized P&L": t.realized_pnl,
+                "Opened": t.opened_at,
+                "Closed": t.closed_at,
+                "Reason": t.close_reason,
+            }
+            for t in trades
+        ]
+    )
+
+
+@st.cache_resource
+def get_mlb_ledger() -> MlbLedger:
+    return MlbLedger()
+
+
+def _mlb_panel() -> None:
+    """MLB game-winner strategy -- a fully separate real-money process from
+    the crypto bot (own pidfile/ledger/db, see trade_bot/mlb_strategy.py
+    and run_mlb_trading.py), not a sub-toggle inside it. Placeholder dollar
+    caps (run_mlb_trading.RISK_LIMITS) haven't been set through a real
+    decision yet -- see that module's docstring."""
+    st.divider()
+    st.subheader("⚾ MLB Trading")
+    mlb_ledger = get_mlb_ledger()
+    running, pid = mlb_bot_control.is_running()
+
+    mlb_trading_enabled = mlb_ledger.get_mlb_trading_enabled()
+    new_mlb_trading_enabled = st.toggle(
+        "⚾ MLB game-winner trading",
+        value=mlb_trading_enabled,
+        key="mlb_trading_enabled",
+        help=(
+            "ON: before each game's first pitch, buys the team a fitted model predicts to win, "
+            "if its predicted probability clears a real gate and the price isn't already deep into "
+            "favorite territory. Holds to the game's real outcome, no active exit management. "
+            "Requires the MLB process itself to be running (Start button below) -- this toggle only "
+            "controls whether that process actually places trades once it's up. Also pauses new "
+            "crypto entries while ON (existing crypto positions still get managed normally) -- "
+            "the two strategies share the same real account balance, so they don't compete for it "
+            "at the same time."
+        ),
+    )
+    if new_mlb_trading_enabled != mlb_trading_enabled:
+        mlb_ledger.set_mlb_trading_enabled(new_mlb_trading_enabled)
+        st.rerun()
+
+    c1, c2, c3 = st.columns([2, 1, 2])
+    with c1:
+        if running:
+            started = mlb_bot_control.started_at()
+            uptime = ""
+            if started:
+                secs = time.time() - started
+                uptime = f" · up {secs / 60:.0f}min" if secs < 3600 else f" · up {secs / 3600:.1f}h"
+            st.success(f"🟢 RUNNING (PID {pid}){uptime}")
+        else:
+            st.error("🔴 STOPPED")
+    with c2:
+        if st.button("🛑 STOP", width="stretch", type="primary", disabled=not running, key="mlb_stop"):
+            ok, msg = mlb_bot_control.stop()
+            (st.success if ok else st.warning)(msg)
+            time.sleep(0.5)
+            st.rerun()
+    with c3:
+        with st.popover("▶️ Start MLB Bot", width="stretch", disabled=running):
+            st.warning("This places **real orders with real money** on your Kalshi account.")
+            st.caption(
+                f"Capital cap ${run_mlb_trading.RISK_LIMITS.max_capital_dollars:.0f} · "
+                f"per-trade up to ${run_mlb_trading.RISK_LIMITS.max_position_size_dollars:.0f} · "
+                f"daily kill-switch ${run_mlb_trading.RISK_LIMITS.daily_stop_loss_dollars:.0f} -- "
+                "placeholder caps, not yet a considered real-money decision (see run_mlb_trading.py)."
+            )
+            confirmed = st.checkbox("I understand this places real orders with real money.", key="mlb_start_confirm")
+            if st.button("Confirm & Start", type="primary", disabled=not confirmed, key="mlb_start_button"):
+                ok, msg = mlb_bot_control.start()
+                (st.success if ok else st.error)(msg)
+                time.sleep(0.5)
+                st.rerun()
+
+    open_trades = mlb_ledger.get_all_open_trades()
+    closed_trades = mlb_ledger.get_closed_trades(limit=100)
+    st.caption(f"{len(open_trades)} open · {len(closed_trades)} closed · "
+               f"total realized P&L ${mlb_ledger.get_total_realized_pnl():+,.2f}")
+    if closed_trades:
+        st.dataframe(_style_pnl_column(_mlb_trades_df(closed_trades), "Realized P&L"), hide_index=True, width="stretch")
+    else:
+        st.info("No closed MLB trades yet.")
 
 
 def _live_summary_section(client: KalshiClient, ledger: LiveLedger) -> None:
@@ -1159,6 +1284,63 @@ def live_trading_tab() -> None:
     _live_trades_section(ledger)
     _live_events_section(ledger)
 
+    _mlb_panel()
+
+
+_BTC_PRICE_WINDOW_LABELS = {
+    "5m": "5 min", "15m": "15 min", "1h": "1 hour", "3h": "3 hours",
+    "1d": "1 day", "3d": "3 days", "1w": "1 week", "1mo": "1 month",
+}
+
+
+@st.fragment(run_every=REFRESH_SECONDS)
+def btc_price_tab() -> None:
+    st.subheader("₿ BTC/USD Price History")
+    history = get_btc_price_history()
+    earliest = history.get_earliest_timestamp()
+    if earliest is None:
+        st.info("No data collected yet -- the collector just started. Check back in a few minutes.")
+        return
+
+    availability = history.get_availability()
+    # Only windows with enough real elapsed collection time show up at all --
+    # per explicit user request ("enable these tabs when the data for that
+    # time is available"), rather than showing e.g. a "1 month" view built
+    # from a few days of real data.
+    available_windows = [w for w in BTC_PRICE_WINDOWS if availability.get(w)]
+    st.caption(
+        "Collected every second from Coinbase's public spot price feed (independent of Kalshi and both "
+        f"trading bots) since {earliest.strftime('%Y-%m-%d %H:%M UTC')}. Longer windows appear automatically "
+        "once enough time has passed to plot them meaningfully."
+    )
+
+    selected = st.radio(
+        "Window", available_windows, format_func=lambda w: _BTC_PRICE_WINDOW_LABELS[w],
+        horizontal=True, key="btc_price_window",
+    )
+    points = history.get_history(selected)
+    if len(points) < 2:
+        st.info("Not enough data yet for this window.")
+        return
+
+    df = pd.DataFrame(points)
+    df["t"] = pd.to_datetime(df["t"])
+    chart = (
+        alt.Chart(df)
+        .mark_line(color="#f7931a", strokeWidth=2)
+        .encode(
+            x=alt.X("t:T", title=None),
+            y=alt.Y("price:Q", title="BTC/USD", scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip("t:T", title="Time"), alt.Tooltip("price:Q", title="Price", format="$,.2f")],
+        )
+    )
+    st.altair_chart(chart.properties(height=400), width="stretch")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Latest", f"${df['price'].iloc[-1]:,.2f}")
+    c2.metric("High", f"${df['price'].max():,.2f}")
+    c3.metric("Low", f"${df['price'].min():,.2f}")
+
 
 def main() -> None:
     st.title("Kalshi Trading Bot")
@@ -1169,7 +1351,7 @@ def main() -> None:
     # seconds of latency. Query-param routing only executes the active view.
     current_tab = st.query_params.get("tab", "markets")
 
-    nav_col1, nav_col2, nav_col3, _ = st.columns([1, 1, 1, 3])
+    nav_col1, nav_col2, nav_col3, nav_col4, _ = st.columns([1, 1, 1, 1, 2])
     if nav_col1.button(
         "📊 Markets", width="stretch", type="primary" if current_tab == "markets" else "secondary"
     ):
@@ -1185,6 +1367,11 @@ def main() -> None:
     ):
         st.query_params["tab"] = "live"
         st.rerun()
+    if nav_col4.button(
+        "₿ BTC Price", width="stretch", type="primary" if current_tab == "btc_price" else "secondary"
+    ):
+        st.query_params["tab"] = "btc_price"
+        st.rerun()
     st.divider()
 
     if current_tab == "paper":
@@ -1193,6 +1380,8 @@ def main() -> None:
     elif current_tab == "live":
         st.caption("⚠️ REAL MONEY — real orders are placed against your actual Kalshi account")
         live_trading_tab()
+    elif current_tab == "btc_price":
+        btc_price_tab()
     else:
         markets_tab()
 

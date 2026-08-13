@@ -1,0 +1,32 @@
+[Unit]
+Description=Kalshi trade bot JSON API - for the native Android app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/home/tradebot/TRADE_BOT
+# 127.0.0.1 only -- same reasoning as dashboard.service. Caddy is the only
+# thing that ever reaches this from outside, and it requires the same
+# password as the dashboard for every path including /api/*.
+ExecStart=/home/tradebot/TRADE_BOT/.venv/bin/python3 run_api.py
+Restart=always
+RestartSec=5
+# See dashboard.service's KillMode note -- same hazard, same fix. Either
+# service can be the one that issues bot_control.start() (whichever UI the
+# user hits Start from), so both need this.
+KillMode=process
+StandardOutput=append:/home/tradebot/TRADE_BOT/logs/api_stdout.log
+StandardError=append:/home/tradebot/TRADE_BOT/logs/api_stdout.log
+
+# Hardening. ProtectHome deliberately left at its default (off) -- see
+# dashboard.service's note, same reasoning (app lives inside /home/tradebot).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/tradebot/TRADE_BOT
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

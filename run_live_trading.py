@@ -58,6 +58,7 @@ import sys
 
 from trade_bot.adaptive import AdaptiveConfig, PerformanceGovernor
 from trade_bot.bot_control import CONFIRMATION_PHRASE, remove_pidfile, write_pidfile
+from trade_bot.btc_price_history import BtcPriceHistory
 from trade_bot.client import KalshiClient
 from trade_bot.data_driven_strategy import DataDrivenCryptoStrategy
 from trade_bot.interval_tracker import IntervalTracker
@@ -66,7 +67,23 @@ from trade_bot.live_ledger import LiveLedger
 from trade_bot.online_learner import OnlineLogisticLearner
 from trade_bot.watchlist import ACTIVE_CRYPTO_SERIES_PREFIXES, build_crypto_watchlist
 
-INTERVAL_SECONDS = 20
+# REVISED 2026-08-06: was 20 -- measured directly against real closed stop-
+# loss trades (59 since 2026-08-05) that the ACTUAL fill routinely lands far
+# past the configured stop threshold: median overshoot 7.1 percentage
+# points, p75 13.3pp, max 50.1pp, with 34% of trades overshooting by more
+# than 10pp. That gap is price moving between polls before a breach is even
+# detected, on markets that can swing hard in their final minutes. Halving
+# the interval doesn't eliminate this (still 1-2 real API calls per ticker
+# per cycle, ~11 tickers), but directly shrinks the window in which price
+# can move against an open position undetected.
+INTERVAL_SECONDS = 10
+
+# Added 2026-08-06: LiveExecutionEngine previously had no re-entry cooldown
+# at all -- see trade_bot/live_engine.py's constructor comment for the real
+# data (same ticker stopped out repeatedly within minutes) that motivated
+# porting over this already-proven paper-engine mechanism. Same default the
+# paper engine has always used.
+REENTRY_COOLDOWN_MINUTES = 8.0
 
 # Exposed so app.py/api.py can look up THIS strategy's governor/ledger stats
 # by the right name dynamically (governor.evaluate(STRATEGY_NAME)) instead
@@ -83,9 +100,11 @@ STRATEGY_NAME = DataDrivenCryptoStrategy.name
 # barely predicts outcomes at all in a fitted logistic regression, while
 # order-book imbalance (never used to drive an entry before) and volatility
 # (previously only a size dampener) are the strongest real signals available.
-# CryptoTechnicalStrategy itself is UNCHANGED and still runs, unmodified, in
-# run_paper_trading.py -- the explicit A/B control for this rewrite, per the
-# same request ("dont change the paper bots algorithm").
+# CryptoTechnicalStrategy itself is UNCHANGED but, as of 2026-08-06, no
+# longer runs anywhere by default -- run_paper_trading.py was repurposed
+# per a later explicit user request to run DataDrivenCryptoStrategy too
+# (tuned more risk-tolerant, uncapped sizing, no hard stops) rather than
+# stay an A/B control for this rewrite. See that file's docstring.
 #
 # Note on why the three 15-min series (KXBTC15M/KXETH15M/KXBNB15M) still
 # lean on scalp as their primary mechanism: a 15-min market's whole life is
@@ -113,13 +132,20 @@ STRATEGY_PARAMS = dict(
     max_volatility_pct=6.5,
     # Absolute predicted-win-probability gate from a batch-fit logistic
     # regression (trade_bot/data_driven_strategy.py's PROBABILITY_MODEL_*
-    # constants), calibrated against a chronological 20% holdout: the full
-    # combined gate (imbalance floor + volatility ceiling + this threshold)
-    # took 16/63 holdout trades (25%) at 56.2% win rate, vs. 41.3% for all
-    # 63 -- real, if modest, out-of-sample separation. See
-    # refit_strategy_model.py to regenerate these constants later as more
-    # real trades accumulate.
-    min_win_probability=0.43,
+    # constants). Raised 0.43 -> 0.50 on 2026-08-12 per explicit user
+    # request, after refit_strategy_model.py's holdout backtest against the
+    # (also just-refreshed) 999-trade model showed 0.43 barely beats doing
+    # nothing (45.3% win rate on 161/200 held-out trades vs. a 45.0% base
+    # rate) while 0.50 shows a real lift (52.9% win rate on 70/200 taken).
+    # Checked before shipping: the model's own predictions across all 999
+    # real trades range 0.314-0.618 (median 0.447, p90 0.515) -- 0.50 lets
+    # through ~16% of historical candidates, meaningfully more selective
+    # without starving the bot the way a higher cutoff would (0.55 would
+    # have cleared only 2% of the same 999, the same near-total-halt failure
+    # mode already hit once with ML_GATE_THRESHOLD on 2026-08-04 -- checked
+    # and explicitly rejected for that reason). See refit_strategy_model.py
+    # to regenerate all of this later as more real trades accumulate.
+    min_win_probability=0.50,
     min_entry_price_pct=45.0,
     max_entry_price_pct=85.0,
     min_minutes_to_close=6.0,
@@ -134,6 +160,13 @@ STRATEGY_PARAMS = dict(
     stop_loss_pct=0.20,
     stop_loss_time_bonus_pct=0.10,
     stop_loss_time_reference_minutes=60.0,
+    # Added 2026-08-07 -- see trade_bot/data_driven_strategy.py's field
+    # comment for the full writeup. Short version: real stop-loss overshoot
+    # on 2026-08-06 was median 11.2pp on the three 15-min series vs 1.8pp
+    # on the hourly ones (max 41.1pp vs 14.3pp) -- these markets swing
+    # harder near their own close, same reasoning as
+    # urgency_minutes_15min_bonus below.
+    stop_loss_pct_15min_bonus=0.15,
     trail_activate_pct=0.05,
     trail_giveback_pct=0.03,
     max_profit_pct=0.25,
@@ -145,17 +178,33 @@ STRATEGY_PARAMS = dict(
     # instead of) the bot-watchdog fix for the downtime that caused most of
     # the worst individual cases.
     urgency_minutes_15min_bonus=1.5,
-    scalp_enabled=True,
+    # DISABLED 2026-08-06 -- see trade_bot/data_driven_strategy.py's field
+    # comment for the full investigation. Short version: three tuning
+    # rounds couldn't make this profitable, and a trigger-size breakdown
+    # showed every bucket losing money, not just the big/noisy ones --
+    # there's no configuration of this mechanism found to work yet.
+    scalp_enabled=False,
     scalp_window_seconds=45.0,
     scalp_threshold_pct=1.5,
     scalp_dollars=5.0,
-    scalp_take_profit_pct=0.08,
+    # REVISED 2026-08-06 -- see trade_bot/data_driven_strategy.py's field
+    # comment for the full writeup. Short version: an 8% target against the
+    # 0.20 stop below needs 71% win rate to break even; real win rate was
+    # ~36-42%. 53% of actual scalp stop-loss trades since 2026-08-05 would
+    # have won if held, so there's real follow-through to capture.
+    scalp_take_profit_pct=0.12,
     # REVISED 2026-08-05: was 0.08, firing on 74% of scalp trades at 5.7%
     # win rate, 68.6% of which would have won if held -- same finding as
     # the standard stop_loss_pct above, worse. scalp_max_hold_minutes
     # already forces an exit regardless of price, so this doesn't undercut
     # "fast in/out", it just stops the stop from deciding most outcomes.
-    scalp_stop_loss_pct=0.20,
+    # REVISED AGAIN 2026-08-06 -- see trade_bot/data_driven_strategy.py's
+    # field comment. Short version: independent cross-check via
+    # interval_outcomes (actual entry side vs actual settlement, not a log-
+    # scraped proxy) found scalp_stop_loss was still the single largest
+    # source of "direction was right, still lost money" trades (12 of 25,
+    # -$9.87) since the previous widening.
+    scalp_stop_loss_pct=0.28,
     scalp_max_hold_minutes=2.5,
     momentum_hold_enabled=True,
     momentum_hold_confirm_minutes=1.0,
@@ -214,24 +263,20 @@ RISK_LIMITS = LiveRiskLimits(
 # examples to learn anything meaningful for a while. Persisted in
 # live_trading.db so it keeps whatever it's learned across restarts.
 #
-# Threshold temporarily dropped to 0.0 on 2026-08-04: after a real losing
-# stretch (31% win rate over the last 29 learner-fed trades), the model's
-# bias term went sharply negative while its per-feature (momentum) weights
-# were still too small after only 48 updates to meaningfully discriminate
-# good setups from bad -- so it was outputting a near-uniform ~35% on
-# almost every candidate and the 0.40 gate blocked 97% of all signals for
-# 6+ hours straight (1081/1117), effectively halting the bot. User chose to
-# disable the hard block rather than sit idle waiting for it to recover.
-# This does NOT disable the model: predict_proba() below still runs and
-# still *dampens* size via ml_multiplier (min sizing floor 0.5x stays in
-# effect), and every real close still feeds _update_learner() exactly as
-# before -- only the hard veto (`if p_win < threshold: return`) is
-# neutralized, since sigmoid output is always >= 0.0. Governor and all hard
-# risk limits (capital/position caps, per-trade sizing) are unaffected.
-# Restore to 0.40 (or reassess) once the model has enough fresh real
-# outcomes to actually differentiate rather than reflect one bad patch.
+# Threshold restored to 0.40 on 2026-08-11, per the plan above: the model
+# now has 903 real learner updates (vs. 48 when it was dropped to 0.0) and
+# its output is no longer the degenerate near-uniform ~35% seen back then --
+# live predicted win probabilities since 2026-08-09 range 27%-65% (median
+# 43%), and a 0.40 gate against that distribution blocks ~34% of candidates,
+# not the 97% that forced the original disable. The model's learned feature
+# weights now also line up with what the real ledger shows independent of
+# the model (e.g. asset_btc +0.30 / asset_eth -0.18: BTC bot-trades have the
+# best win rate of the three assets in both the full 959-trade history and
+# the most recent 199-trade window, ETH/BNB are both worse) -- evidence it
+# has learned a real, not spurious, pattern. Reassess again if this starts
+# blocking a large fraction of signals the way it did in the 48-update state.
 MIN_TRADES_FOR_ML_GATE = 20
-ML_GATE_THRESHOLD = 0.0
+ML_GATE_THRESHOLD = 0.40
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
 
@@ -273,7 +318,10 @@ def main() -> None:
 
     ledger = LiveLedger()
     interval_tracker = IntervalTracker()
-    strategy = DataDrivenCryptoStrategy(**STRATEGY_PARAMS)
+    # Read-only handle onto the continuous BTC/USD collector's db (see
+    # trade_bot/btc_price_history.py) -- the collector process is the only
+    # writer, WAL mode makes concurrent reads from this process safe.
+    strategy = DataDrivenCryptoStrategy(**STRATEGY_PARAMS, btc_price_history=BtcPriceHistory())
     governor = PerformanceGovernor(
         lambda name, limit: ledger.get_recent_realized_pnls_within_hours(name, limit, GOVERNOR_LOOKBACK_HOURS),
         GOVERNOR_CONFIG,
@@ -298,6 +346,17 @@ def main() -> None:
         ml_gate_threshold=ML_GATE_THRESHOLD,
         notify_topic=notify_topic,
         interval_tracker=interval_tracker,
+        reentry_cooldown_minutes=REENTRY_COOLDOWN_MINUTES,
+        # Preserves the exact refresh live_engine.py's run_once() used to
+        # hardcode inline, before that was generalized 2026-08-12 so the
+        # MLB engine could pass its own toggle here instead.
+        extra_toggle_refresh=lambda: setattr(strategy, "btc_dip_enabled", ledger.get_btc_dip_enabled()),
+        # Added 2026-08-13 per explicit user request: crypto and MLB share
+        # the same real Kalshi account/capital -- pause new crypto entries
+        # while MLB trading is turned on, rather than have both strategies
+        # compete for the same balance at once. Existing open crypto
+        # positions still get managed/exited normally either way.
+        pause_new_entries_when=lambda: ledger.get_mlb_trading_enabled(),
     )
 
     print("=" * 70)
